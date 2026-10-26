@@ -1,0 +1,11 @@
+做一个上位机，
+  - 自动识别Voreo USB串口。
+  - ASR识别文字。
+  - 输入文字并调用TTS播放。
+
+
+交互工程在C:\Users\USER\Desktop\DFR1266_Voreo\DFR1266_VOREO\main
+
+界面要求支持用中英文切换
+
+界面要求美观大方，可参考苹果的UI设计理念
