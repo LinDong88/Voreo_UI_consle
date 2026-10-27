@@ -42,6 +42,8 @@ function formatTime(ts: number, locale: Locale) {
 
 const DEFAULT_WAKE = 'HI ESP'
 
+type AtOutcome = { ok: true } | { ok: false; error: string }
+
 function clampLevel(n: unknown, fallback: number) {
   const v = typeof n === 'number' ? n : Number(n)
   if (!Number.isFinite(v)) return fallback
@@ -77,6 +79,7 @@ export default function App() {
   const [chat, setChat] = useState<ChatItem[]>([])
   const [logs, setLogs] = useState<LogItem[]>([])
   const [toast, setToast] = useState<string | null>(null)
+  const [toastTone, setToastTone] = useState<'ok' | 'fail' | null>(null)
   const [sending, setSending] = useState(false)
   const [llmBusy, setLlmBusy] = useState(false)
   const [angle, setAngle] = useState<number | null>(null)
@@ -86,6 +89,7 @@ export default function App() {
   const [llm, setLlm] = useState<LlmConfig>(loadLlmConfig)
   const [sideTab, setSideTab] = useState<'device' | 'ai'>('device')
   const [cmdBusy, setCmdBusy] = useState(false)
+  const [doaPolling, setDoaPolling] = useState(false)
 
   const asrEndRef = useRef<HTMLDivElement | null>(null)
   const wakeTimer = useRef<number | null>(null)
@@ -94,6 +98,9 @@ export default function App() {
   const localeRef = useRef(locale)
   const llmRef = useRef(llm)
   const connectedRef = useRef(connected)
+  const doaPollingRef = useRef(false)
+  const doaPollInFlight = useRef(false)
+  const atWaiters = useRef<Array<{ resolve: (v: AtOutcome) => void; timer: number }>>([])
 
   const api = ensureVoreoApi()
   const hasApi = Boolean(api)
@@ -106,7 +113,32 @@ export default function App() {
   }, [llm])
   useEffect(() => {
     connectedRef.current = connected
+    if (!connected) setDoaPolling(false)
   }, [connected])
+
+  useEffect(() => {
+    doaPollingRef.current = doaPolling
+  }, [doaPolling])
+
+  useEffect(() => {
+    if (!doaPolling || !api) return
+
+    const tick = () => {
+      if (!connectedRef.current || doaPollInFlight.current) return
+      if (atWaiters.current.length > 0) return
+      doaPollInFlight.current = true
+      void api
+        .sendCmd('AT+ANGLE?')
+        .catch(() => undefined)
+        .finally(() => {
+          doaPollInFlight.current = false
+        })
+    }
+
+    tick()
+    const id = window.setInterval(tick, 200)
+    return () => window.clearInterval(id)
+  }, [doaPolling, api])
 
   useEffect(() => {
     localStorage.setItem('voreo-locale', locale)
@@ -119,7 +151,10 @@ export default function App() {
 
   useEffect(() => {
     if (!toast) return
-    const id = window.setTimeout(() => setToast(null), 2400)
+    const id = window.setTimeout(() => {
+      setToast(null)
+      setToastTone(null)
+    }, 2400)
     return () => window.clearTimeout(id)
   }, [toast])
 
@@ -127,30 +162,83 @@ export default function App() {
     setLogs((prev) => [...prev.slice(-100), { id: nowId(), line, at: Date.now() }])
   }
 
+  function flashToast(text: string, tone?: 'ok' | 'fail') {
+    setToastTone(tone ?? null)
+    setToast(text)
+  }
+
+  function waitForAtReply(timeoutMs = 4000): Promise<AtOutcome> {
+    return new Promise((resolve) => {
+      const entry = {
+        resolve,
+        timer: window.setTimeout(() => {
+          const idx = atWaiters.current.indexOf(entry)
+          if (idx >= 0) atWaiters.current.splice(idx, 1)
+          resolve({ ok: false, error: 'timeout' })
+        }, timeoutMs),
+      }
+      atWaiters.current.push(entry)
+    })
+  }
+
+  function cancelLastAtWaiter() {
+    const entry = atWaiters.current.pop()
+    if (!entry) return
+    window.clearTimeout(entry.timer)
+    entry.resolve({ ok: false, error: 'cancelled' })
+  }
+
+  function resolveAtReply(ok: boolean, error?: string): boolean {
+    const entry = atWaiters.current.shift()
+    if (!entry) return false
+    window.clearTimeout(entry.timer)
+    entry.resolve(ok ? { ok: true } : { ok: false, error: error || 'ERROR' })
+    return true
+  }
+
   async function playTts(text: string, kind: ChatItem['kind'] = 'tts') {
     if (!api || !connectedRef.current) {
-      setToast(t(localeRef.current, 'notConnected'))
+      flashToast(t(localeRef.current, 'notConnected'), 'fail')
       return false
     }
     const payload = text.trim()
     if (!payload) return false
     setSending(true)
+    const pending = waitForAtReply(60000)
     const res = await api.sendTts(payload)
-    setSending(false)
     if (!res.ok) {
-      setToast(res.error || t(localeRef.current, 'sendFailed'))
+      cancelLastAtWaiter()
+      setSending(false)
+      flashToast(res.error || t(localeRef.current, 'sendFailed'), 'fail')
+      return false
+    }
+    pushLog(`AT+TTS=${payload}`)
+    const reply = await pending
+    setSending(false)
+    if (!reply.ok) {
+      const msg =
+        reply.error === 'timeout'
+          ? t(localeRef.current, 'cmdTimeout')
+          : t(localeRef.current, 'cmdFail')
+      flashToast(msg, 'fail')
       return false
     }
     setChat((prev) => [...prev, { id: nowId(), kind, text: payload, at: Date.now() }])
-    pushLog(`AT+TTS=${payload}`)
+    flashToast(t(localeRef.current, 'ttsOk'), 'ok')
     return true
   }
 
   async function syncDeviceState() {
     if (!api) return
     for (const line of ['AT+VER?', 'AT+VOL?', 'AT+SPD?', 'AT+WAKEWORD?']) {
+      const pending = waitForAtReply(4000)
       const res = await api.sendCmd(line)
       pushLog(res.ok ? `CMD>${line}` : `CMD ERR ${line}`)
+      if (!res.ok) {
+        cancelLastAtWaiter()
+        continue
+      }
+      await pending
     }
   }
 
@@ -254,7 +342,10 @@ export default function App() {
         setVersion(ver)
       }),
       api.onError(({ message }) => {
-        setToast(message === 'ERROR' ? t(localeRef.current, 'cmdError') : message)
+        // OK/ERROR handled by AT waiters via onLog — avoid duplicate toasts
+        if (atWaiters.current.length > 0) return
+        if (doaPollingRef.current && message === 'ERROR') return
+        flashToast(message === 'ERROR' ? t(localeRef.current, 'cmdError') : message, 'fail')
       }),
       api.onLog(({ line }) => {
         const angleHit = line.match(/^\+?ANGLE:\s*(-?\d+(?:\.\d+)?)/i)
@@ -273,6 +364,12 @@ export default function App() {
           const word = wakeHit[1].trim()
           if (word) setWakeCurrent(word)
         }
+
+        if (/^OK$/i.test(line)) resolveAtReply(true)
+        else if (/^ERROR$/i.test(line)) resolveAtReply(false, 'ERROR')
+
+        // Quiet poll: skip flooding the log with ANGLE replies / OK
+        if (doaPollingRef.current && (/^\+?ANGLE:/i.test(line) || /^OK$/i.test(line))) return
 
         pushLog(line)
       }),
@@ -326,20 +423,43 @@ export default function App() {
     void sendManualTts(ttsText)
   }
 
-  async function sendDeviceCmd(line: string) {
-    if (!api) return { ok: false as const, error: t(locale, 'disconnected') }
-    if (!connectedRef.current) {
-      setToast(t(locale, 'notConnected'))
-      return { ok: false as const, error: t(locale, 'notConnected') }
+  async function sendDeviceCmd(
+    line: string,
+    opts?: { quiet?: boolean; successMsg?: string; timeoutMs?: number },
+  ): Promise<AtOutcome> {
+    if (!api) {
+      if (!opts?.quiet) flashToast(t(locale, 'disconnected'), 'fail')
+      return { ok: false, error: t(locale, 'disconnected') }
     }
+    if (!connectedRef.current) {
+      if (!opts?.quiet) flashToast(t(locale, 'notConnected'), 'fail')
+      return { ok: false, error: t(locale, 'notConnected') }
+    }
+
+    const pending = waitForAtReply(opts?.timeoutMs ?? 4000)
     const res = await api.sendCmd(line)
     if (!res.ok) {
-      setToast(res.error || t(locale, 'sendFailed'))
-      pushLog(`CMD ERR ${line}`)
-    } else {
-      pushLog(`CMD>${line}`)
+      cancelLastAtWaiter()
+      if (!opts?.quiet) {
+        flashToast(res.error || t(locale, 'sendFailed'), 'fail')
+        pushLog(`CMD ERR ${line}`)
+      }
+      return { ok: false, error: res.error || t(locale, 'sendFailed') }
     }
-    return res
+
+    if (!opts?.quiet) pushLog(`CMD>${line}`)
+    const reply = await pending
+    if (!opts?.quiet) {
+      if (reply.ok) {
+        flashToast(opts?.successMsg || t(locale, 'cmdOk'), 'ok')
+      } else {
+        const msg =
+          reply.error === 'timeout' ? t(locale, 'cmdTimeout') : t(locale, 'cmdFail')
+        flashToast(msg, 'fail')
+        pushLog(`CMD FAIL ${line}`)
+      }
+    }
+    return reply
   }
 
   async function applyDeviceSettings() {
@@ -351,11 +471,25 @@ export default function App() {
     localStorage.setItem('voreo-device', JSON.stringify(next))
     setCmdBusy(true)
     try {
-      const vol = await sendDeviceCmd(`AT+VOL=${next.volume}`)
-      if (!vol.ok) return
-      const spd = await sendDeviceCmd(`AT+SPD=${next.speed}`)
-      if (!spd.ok) return
-      setToast(t(locale, 'settingsApplied'))
+      const vol = await sendDeviceCmd(`AT+VOL=${next.volume}`, { quiet: true })
+      pushLog(`CMD>AT+VOL=${next.volume}`)
+      if (!vol.ok) {
+        flashToast(
+          vol.error === 'timeout' ? t(locale, 'cmdTimeout') : t(locale, 'cmdFail'),
+          'fail',
+        )
+        return
+      }
+      const spd = await sendDeviceCmd(`AT+SPD=${next.speed}`, { quiet: true })
+      pushLog(`CMD>AT+SPD=${next.speed}`)
+      if (!spd.ok) {
+        flashToast(
+          spd.error === 'timeout' ? t(locale, 'cmdTimeout') : t(locale, 'cmdFail'),
+          'fail',
+        )
+        return
+      }
+      flashToast(t(locale, 'settingsApplied'), 'ok')
     } finally {
       setCmdBusy(false)
     }
@@ -365,7 +499,7 @@ export default function App() {
     if (action === 'query') {
       setCmdBusy(true)
       try {
-        await sendDeviceCmd('AT+WAKEWORD?')
+        await sendDeviceCmd('AT+WAKEWORD?', { successMsg: t(locale, 'wakeQueryOk') })
       } finally {
         setCmdBusy(false)
       }
@@ -375,16 +509,17 @@ export default function App() {
     const word =
       action === 'restore' ? DEFAULT_WAKE : (wakeDraft.trim() || wakeCurrent).trim()
     if (!word) {
-      setToast(t(locale, 'wakeWordInput'))
+      flashToast(t(locale, 'wakeWordInput'), 'fail')
       return
     }
     setCmdBusy(true)
     try {
-      const res = await sendDeviceCmd(`AT+WAKEWORD=${word}`)
+      const res = await sendDeviceCmd(`AT+WAKEWORD=${word}`, {
+        successMsg: t(locale, 'wakeWordApplied'),
+      })
       if (!res.ok) return
       setWakeCurrent(word)
       if (action === 'restore') setWakeDraft('')
-      setToast(t(locale, 'wakeWordApplied'))
     } finally {
       setCmdBusy(false)
     }
@@ -393,7 +528,7 @@ export default function App() {
   async function refreshAngle() {
     setCmdBusy(true)
     try {
-      await sendDeviceCmd('AT+ANGLE?')
+      await sendDeviceCmd('AT+ANGLE?', { successMsg: t(locale, 'doaQueryOk') })
     } finally {
       setCmdBusy(false)
     }
@@ -517,7 +652,20 @@ export default function App() {
             </form>
           </section>
 
-          <DoaPanel locale={locale} angle={angle} onRefresh={() => void refreshAngle()} busy={cmdBusy} />
+          <DoaPanel
+            locale={locale}
+            angle={angle}
+            onRefresh={() => void refreshAngle()}
+            polling={doaPolling}
+            onTogglePoll={() => {
+              if (!connectedRef.current) {
+                flashToast(t(locale, 'notConnected'), 'fail')
+                return
+              }
+              setDoaPolling((v) => !v)
+            }}
+            busy={cmdBusy}
+          />
         </div>
 
         <aside className="side-col">
@@ -627,7 +775,9 @@ export default function App() {
         </aside>
       </div>
 
-      {toast ? <div className="toast">{toast}</div> : null}
+      {toast ? (
+        <div className={`toast${toastTone ? ` ${toastTone}` : ''}`}>{toast}</div>
+      ) : null}
     </div>
   )
 }
