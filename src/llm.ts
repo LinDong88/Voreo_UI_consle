@@ -4,6 +4,8 @@ export type LlmConfig = {
   model: string
   enabled: boolean
   autoReply: boolean
+  /** When LLM is not configured, use fixed demo replies only if this is on. */
+  useDemoReply: boolean
 }
 
 export const defaultLlmConfig = (): LlmConfig => ({
@@ -12,6 +14,7 @@ export const defaultLlmConfig = (): LlmConfig => ({
   model: '',
   enabled: false,
   autoReply: true,
+  useDemoReply: false,
 })
 
 export function loadLlmConfig(): LlmConfig {

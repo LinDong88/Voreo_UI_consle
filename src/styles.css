@@ -6,8 +6,8 @@
   --ink-soft: #6e6e73;
   --ink-faint: #86868b;
   --line: rgba(0, 0, 0, 0.08);
-  --glass: rgba(255, 255, 255, 0.62);
-  --glass-strong: rgba(255, 255, 255, 0.78);
+  --glass: rgba(255, 255, 255, 0.9);
+  --glass-strong: rgba(255, 255, 255, 0.96);
   --blue: #0071e3;
   --blue-press: #0077ed;
   --green: #34c759;
@@ -151,22 +151,26 @@ button:disabled {
   grid-template-columns: 1.2fr 0.9fr;
   gap: 18px;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
+  align-items: stretch;
 }
 
 .card {
-  min-height: 0;
+  flex: 0 0 auto;
+  min-height: auto;
   border-radius: var(--radius);
   background: var(--glass);
   backdrop-filter: blur(22px) saturate(170%);
-  border: 1px solid rgba(255, 255, 255, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.7);
   box-shadow: var(--shadow);
   display: flex;
   flex-direction: column;
+  overflow: hidden;
+  isolation: isolate;
 }
 
 .card-pad {
-  padding: 22px 24px;
+  padding: 18px 20px;
 }
 
 .status-card {
@@ -266,6 +270,13 @@ select.port {
     box-shadow 160ms ease;
 }
 
+.btn-sm {
+  height: 30px;
+  padding: 0 12px;
+  font-size: 12px;
+  border-radius: 10px;
+}
+
 .btn-primary {
   background: var(--blue);
   color: #fff;
@@ -285,7 +296,7 @@ select.port {
 .asr-card {
   position: relative;
   overflow: auto;
-  min-height: 280px;
+  min-height: 220px;
   flex: 1 1 auto;
 }
 
@@ -465,20 +476,66 @@ select.port {
 .main-col {
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 16px;
   min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 2px;
 }
 
 .side-col {
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 14px;
   min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 2px;
+}
+
+.side-col > .card,
+.side-col > .side-stack {
+  flex: 0 0 auto;
+}
+
+.side-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.65);
+  flex: 0 0 auto;
+}
+
+.side-tabs button {
+  height: 36px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--ink-soft);
+  transition:
+    background 160ms ease,
+    color 160ms ease;
+}
+
+.side-tabs button.active {
+  background: #fff;
+  color: var(--ink);
+  box-shadow: 0 4px 14px rgba(15, 35, 60, 0.08);
+}
+
+.side-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
 }
 
 .log-card {
-  min-height: 160px;
-  max-height: 240px;
+  min-height: 120px;
+  max-height: 180px;
+  flex: 0 0 auto;
 }
 
 .text-input {
@@ -608,6 +665,23 @@ select.port {
 
 .btn-grid .wide {
   grid-column: 1 / -1;
+}
+
+.btn-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.btn-row .btn {
+  flex: 1 1 auto;
+  min-width: 72px;
+}
+
+.toggle-pair {
+  display: grid;
+  gap: 10px;
 }
 
 .doa-body {

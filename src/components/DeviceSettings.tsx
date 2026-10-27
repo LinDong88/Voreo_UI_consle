@@ -2,9 +2,7 @@ import { Locale, t } from '../i18n'
 
 export type DeviceSettingsState = {
   volume: number
-  locateLight: boolean
-  wakeSensitivity: number
-  ledDirection: boolean
+  speed: number
 }
 
 type Props = {
@@ -12,17 +10,17 @@ type Props = {
   value: DeviceSettingsState
   onChange: (next: DeviceSettingsState) => void
   onApply: () => void
+  busy?: boolean
 }
 
-export function DeviceSettings({ locale, value, onChange, onApply }: Props) {
+export function DeviceSettings({ locale, value, onChange, onApply, busy }: Props) {
   return (
     <section className="card card-pad">
       <div className="card-head">
         <h2 className="section-title">{t(locale, 'settingsTitle')}</h2>
-        <span className="chip subtle">{t(locale, 'placeholderHint')}</span>
       </div>
 
-      <div className="settings-grid">
+      <div className="settings-grid tight">
         <label className="field">
           <span>
             {t(locale, 'volume')}
@@ -39,46 +37,20 @@ export function DeviceSettings({ locale, value, onChange, onApply }: Props) {
 
         <label className="field">
           <span>
-            {t(locale, 'wakeSensitivity')}
-            <em>{value.wakeSensitivity}</em>
+            {t(locale, 'speed')}
+            <em>{value.speed}</em>
           </span>
           <input
             type="range"
-            min={1}
-            max={10}
-            value={value.wakeSensitivity}
-            onChange={(e) => onChange({ ...value, wakeSensitivity: Number(e.target.value) })}
+            min={0}
+            max={15}
+            value={value.speed}
+            onChange={(e) => onChange({ ...value, speed: Number(e.target.value) })}
           />
         </label>
-
-        <div className="toggle-row">
-          <span>{t(locale, 'locateLight')}</span>
-          <button
-            type="button"
-            className={`toggle ${value.locateLight ? 'on' : ''}`}
-            onClick={() => onChange({ ...value, locateLight: !value.locateLight })}
-            aria-pressed={value.locateLight}
-          >
-            <i />
-            {value.locateLight ? t(locale, 'on') : t(locale, 'off')}
-          </button>
-        </div>
-
-        <div className="toggle-row">
-          <span>{t(locale, 'ledDirection')}</span>
-          <button
-            type="button"
-            className={`toggle ${value.ledDirection ? 'on' : ''}`}
-            onClick={() => onChange({ ...value, ledDirection: !value.ledDirection })}
-            aria-pressed={value.ledDirection}
-          >
-            <i />
-            {value.ledDirection ? t(locale, 'on') : t(locale, 'off')}
-          </button>
-        </div>
       </div>
 
-      <button type="button" className="btn btn-ghost block" onClick={onApply}>
+      <button type="button" className="btn btn-primary block" onClick={onApply} disabled={busy}>
         {t(locale, 'apply')}
       </button>
     </section>

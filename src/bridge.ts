@@ -192,7 +192,12 @@ function createBridge(wsUrl: string): VoreoApi {
       return { ok: Boolean(res.ok) }
     },
     sendTts: async (text) => {
-      const res = await request('tts', { type: 'tts', text })
+      const payload = String(text ?? '').replace(/\r?\n/g, ' ').trim()
+      const res = await request('tts', { type: 'tts', text: `AT+TTS=${payload}` })
+      return { ok: Boolean(res.ok), error: res.error as string | undefined }
+    },
+    sendCmd: async (line) => {
+      const res = await request('cmd', { type: 'cmd', text: line })
       return { ok: Boolean(res.ok), error: res.error as string | undefined }
     },
     getStatus: async () => ({ connected: status.connected, path: status.path }),

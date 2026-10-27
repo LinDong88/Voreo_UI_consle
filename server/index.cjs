@@ -62,48 +62,39 @@ function handleLine(line) {
   const text = line.replace(/^\uFEFF/, '').replace(/\r$/, '').trim()
   if (!text) return
 
-  const asr = text.match(/^ASR\s*[:：]\s*(.*)$/i)
+  /* AT URC / replies: +ASR / +WAKE / +VER / +ANGLE / +VOL / +SPD / +WAKEWORD / OK / ERROR */
+  const asr = text.match(/^\+ASR\s*[:：]\s*(.*)$/i) || text.match(/^ASR\s*[:：]\s*(.*)$/i)
   if (asr) {
     const payload = asr[1] ?? ''
     console.log('[voreo] ASR:', payload)
     broadcast('asr', { text: payload })
-    broadcast('log', { line: `ASR:${payload}` })
+    broadcast('log', { line: text })
     return
   }
-  if (/^WAKE$/i.test(text)) {
+  if (/^\+?WAKE$/i.test(text)) {
     console.log('[voreo] WAKE')
     broadcast('wake')
-    broadcast('log', { line: 'WAKE' })
+    broadcast('log', { line: text })
     return
   }
-  const ver = text.match(/^VER\s*[:：]\s*(.*)$/i)
+  const ver = text.match(/^\+VER\s*[:：]\s*(.*)$/i) || text.match(/^VER\s*[:：]\s*(.*)$/i)
   if (ver) {
     broadcast('version', { version: ver[1] || '' })
     broadcast('log', { line: text })
     return
   }
-  if (/^ERR\s*[:：]/i.test(text)) {
-    broadcast('error', { message: text.replace(/^ERR\s*[:：]\s*/i, '').trim() })
+  if (/^ERROR$/i.test(text) || /^ERR\s*[:：]/i.test(text)) {
+    const message = /^ERROR$/i.test(text)
+      ? 'ERROR'
+      : text.replace(/^ERR\s*[:：]\s*/i, '').trim()
+    broadcast('error', { message })
     broadcast('log', { line: text })
     return
   }
 
-  /* Forward-compatible DOA / confidence lines for future USB protocol */
-  const doa = text.match(/^(?:DOA|ANGLE):\s*(-?\d+(?:\.\d+)?)(?:\s*[,/]\s*(\d+(?:\.\d+)?))?/i)
+  const doa = text.match(/^\+?ANGLE:\s*(-?\d+(?:\.\d+)?)/i)
   if (doa) {
-    const angle = Number(doa[1])
-    const confidence = doa[2] != null ? Number(doa[2]) : undefined
-    broadcast('doa', {
-      angle,
-      confidence: confidence != null ? (confidence > 1 ? confidence / 100 : confidence) : undefined,
-    })
-    broadcast('log', { line: text })
-    return
-  }
-  const conf = text.match(/^CONF(?:IDENCE)?:\s*(\d+(?:\.\d+)?)/i)
-  if (conf) {
-    const c = Number(conf[1])
-    broadcast('doa', { confidence: c > 1 ? c / 100 : c })
+    broadcast('doa', { angle: Number(doa[1]) })
     broadcast('log', { line: text })
     return
   }
@@ -188,7 +179,8 @@ async function autoConnect() {
   }
 }
 
-function sendTts(text) {
+/** Write one text line to the device (TTS or command: VOL / SPD / ANGLE / WAKEWORD). */
+function sendLine(text) {
   if (!port?.isOpen) return Promise.resolve({ ok: false, error: 'Not connected' })
   const payload = String(text ?? '').replace(/\r?\n/g, ' ').trim()
   if (!payload) return Promise.resolve({ ok: false, error: 'Empty' })
@@ -296,9 +288,9 @@ wss.on('connection', (ws) => {
       ws.send(JSON.stringify({ type: 'result', action: 'disconnect', ok: true }))
       return
     }
-    if (msg.type === 'tts') {
-      const result = await sendTts(msg.text)
-      ws.send(JSON.stringify({ type: 'result', action: 'tts', ...result }))
+    if (msg.type === 'tts' || msg.type === 'cmd') {
+      const result = await sendLine(msg.text)
+      ws.send(JSON.stringify({ type: 'result', action: msg.type, ...result }))
     }
   })
 

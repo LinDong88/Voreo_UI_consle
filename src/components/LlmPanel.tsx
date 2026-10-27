@@ -16,7 +16,11 @@ export function LlmPanel({ locale, value, onChange, onSave }: Props) {
       <div className="card-head">
         <h2 className="section-title">{t(locale, 'llmTitle')}</h2>
         <span className={`chip ${ready ? 'ok' : 'subtle'}`}>
-          {ready ? t(locale, 'llmReady') : t(locale, 'llmDemo')}
+          {ready
+            ? t(locale, 'llmReady')
+            : value.useDemoReply
+              ? t(locale, 'llmDemo')
+              : t(locale, 'llmIdle')}
         </span>
       </div>
 
@@ -58,6 +62,15 @@ export function LlmPanel({ locale, value, onChange, onSave }: Props) {
             onChange={(e) => onChange({ ...value, autoReply: e.target.checked })}
           />
           <span>{t(locale, 'llmAuto')}</span>
+        </label>
+
+        <label className="check-row">
+          <input
+            type="checkbox"
+            checked={value.useDemoReply}
+            onChange={(e) => onChange({ ...value, useDemoReply: e.target.checked })}
+          />
+          <span>{t(locale, 'llmUseDemo')}</span>
         </label>
       </div>
 

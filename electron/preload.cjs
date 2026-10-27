@@ -4,7 +4,11 @@ contextBridge.exposeInMainWorld('voreo', {
   listPorts: () => ipcRenderer.invoke('serial:list'),
   connect: (portPath) => ipcRenderer.invoke('serial:connect', portPath),
   disconnect: () => ipcRenderer.invoke('serial:disconnect'),
-  sendTts: (text) => ipcRenderer.invoke('serial:send', text),
+  sendTts: (text) => {
+    const payload = String(text ?? '').replace(/\r?\n/g, ' ').trim()
+    return ipcRenderer.invoke('serial:send', `AT+TTS=${payload}`)
+  },
+  sendCmd: (line) => ipcRenderer.invoke('serial:send', line),
   getStatus: () => ipcRenderer.invoke('serial:status'),
   onStatus: (cb) => {
     const handler = (_e, data) => cb(data)

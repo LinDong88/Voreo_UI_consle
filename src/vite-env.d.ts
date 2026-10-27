@@ -25,6 +25,8 @@ export type VoreoApi = {
   connect: (portPath: string) => Promise<{ ok: boolean; path?: string; error?: string }>
   disconnect: () => Promise<{ ok: boolean }>
   sendTts: (text: string) => Promise<{ ok: boolean; error?: string }>
+  /** Send an AT line: AT+VOL= / AT+SPD= / AT+ANGLE? / AT+WAKEWORD= / AT+VER? … */
+  sendCmd: (line: string) => Promise<{ ok: boolean; error?: string }>
   getStatus: () => Promise<{ connected: boolean; path: string | null }>
   onStatus: (cb: (data: SerialStatus) => void) => () => void
   onPorts: (cb: (data: { ports: SerialPortInfo[] }) => void) => () => void
