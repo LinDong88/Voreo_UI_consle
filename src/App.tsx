@@ -5,7 +5,7 @@ import { DeviceStateIcon } from './components/DeviceStateIcon'
 import { DoaPanel } from './components/DoaPanel'
 import { LlmPanel } from './components/LlmPanel'
 import { WakeWordPanel } from './components/WakeWordPanel'
-import { DeviceStateName, isModuleReady, parseDeviceState } from './deviceState'
+import { DeviceStateName, isModuleReady, isStateInitPending, parseDeviceState } from './deviceState'
 import { Locale, t } from './i18n'
 import {
   askLlm,
@@ -104,7 +104,9 @@ export default function App() {
   const connectedRef = useRef(connected)
   const doaPollingRef = useRef(false)
   const doaPollInFlight = useRef(false)
-  const atWaiters = useRef<Array<{ resolve: (v: AtOutcome) => void; timer: number }>>([])
+  const atWaiters = useRef<
+    Array<{ resolve: (v: AtOutcome) => void; timer: number; quiet: boolean }>
+  >([])
 
   const api = ensureVoreoApi()
   const hasApi = Boolean(api)
@@ -121,6 +123,12 @@ export default function App() {
       setDoaPolling(false)
       setDeviceState(null)
       deviceStateRef.current = null
+      return
+    }
+    // Open/connect: default initializing until first ready STATE
+    if (deviceStateRef.current == null) {
+      setDeviceState('BOOTING')
+      deviceStateRef.current = 'BOOTING'
     }
   }, [connected])
 
@@ -128,12 +136,22 @@ export default function App() {
     deviceStateRef.current = deviceState
   }, [deviceState])
 
+  /** Init only: poll AT+STATE? every 1s until a non-BOOTING state (query or URC). */
   useEffect(() => {
     if (!connected || !api) return
+    if (!isStateInitPending(deviceState)) return
+
     let cancelled = false
     const tick = async () => {
       if (cancelled || !connectedRef.current || atWaiters.current.length > 0) return
-      await api.sendCmd('AT+STATE?')
+      if (!isStateInitPending(deviceStateRef.current)) return
+      const pending = waitForAtReply(4000, true)
+      const res = await api.sendCmd('AT+STATE?')
+      if (!res.ok) {
+        cancelLastAtWaiter()
+        return
+      }
+      await pending
     }
     void tick()
     const id = window.setInterval(() => void tick(), 1000)
@@ -141,7 +159,7 @@ export default function App() {
       cancelled = true
       window.clearInterval(id)
     }
-  }, [connected, api])
+  }, [connected, api, deviceState])
 
   useEffect(() => {
     doaPollingRef.current = doaPolling
@@ -154,8 +172,15 @@ export default function App() {
       if (!connectedRef.current || doaPollInFlight.current) return
       if (atWaiters.current.length > 0) return
       doaPollInFlight.current = true
-      void api
-        .sendCmd('AT+ANGLE?')
+      void (async () => {
+        const pending = waitForAtReply(2000, true)
+        const res = await api.sendCmd('AT+ANGLE?')
+        if (!res.ok) {
+          cancelLastAtWaiter()
+          return
+        }
+        await pending
+      })()
         .catch(() => undefined)
         .finally(() => {
           doaPollInFlight.current = false
@@ -198,10 +223,11 @@ export default function App() {
     setToast(text)
   }
 
-  function waitForAtReply(timeoutMs = 4000): Promise<AtOutcome> {
+  function waitForAtReply(timeoutMs = 4000, quiet = false): Promise<AtOutcome> {
     return new Promise((resolve) => {
       const entry = {
         resolve,
+        quiet,
         timer: window.setTimeout(() => {
           const idx = atWaiters.current.indexOf(entry)
           if (idx >= 0) atWaiters.current.splice(idx, 1)
@@ -219,12 +245,13 @@ export default function App() {
     entry.resolve({ ok: false, error: 'cancelled' })
   }
 
-  function resolveAtReply(ok: boolean, error?: string): boolean {
+  /** @returns 'none' | 'quiet' | 'loud' — quiet waiters (ANGLE poll) skip log */
+  function resolveAtReply(ok: boolean, error?: string): 'none' | 'quiet' | 'loud' {
     const entry = atWaiters.current.shift()
-    if (!entry) return false
+    if (!entry) return 'none'
     window.clearTimeout(entry.timer)
     entry.resolve(ok ? { ok: true } : { ok: false, error: error || 'ERROR' })
-    return true
+    return entry.quiet ? 'quiet' : 'loud'
   }
 
   async function playTts(text: string, kind: ChatItem['kind'] = 'tts') {
@@ -241,9 +268,11 @@ export default function App() {
     if (packets.length === 0) return false
 
     setSending(true)
+    setDeviceState('TTS')
     try {
       for (let i = 0; i < packets.length; i++) {
         const chunk = packets[i]
+        // +TTS:<n> / +STATE:TTS 仅为中间 URC；等最终 OK 再发下一包
         const pending = waitForAtReply(15000)
         const res = await api.sendTts(chunk)
         if (!res.ok) {
@@ -272,7 +301,7 @@ export default function App() {
 
   async function syncDeviceState() {
     if (!api) return
-    for (const line of ['AT+VER?', 'AT+VOL?', 'AT+SPD?', 'AT+WAKEWORD?', 'AT+STATE?']) {
+    for (const line of ['AT+VER?', 'AT+VOL?', 'AT+SPD?', 'AT+WAKEWORD?']) {
       const pending = waitForAtReply(4000)
       const res = await api.sendCmd(line)
       pushLog(res.ok ? line : `ERR ${line}`, res.ok ? 'tx' : 'sys')
@@ -374,7 +403,9 @@ export default function App() {
         if (content) void handleAsrReply(content)
       }),
       api.onWake(() => {
-        /* wake reflected via AT+STATE? → LISTENING */
+        // +WAKE: optimistic; firmware also pushes STATE:LISTENING
+        setDeviceState('LISTENING')
+        deviceStateRef.current = 'LISTENING'
       }),
       api.onVersion(({ version: ver }) => {
         setVersion(ver)
@@ -403,22 +434,33 @@ export default function App() {
           if (word) setWakeCurrent(word)
         }
 
-        const stateHit = line.match(/^\+STATE:\s*(.*)$/i)
+        // Firmware URC / AT+STATE?: STATE:STANDBY / +STATE:LISTENING / …
+        const stateHit = line.match(/^\+?STATE:\s*(.*)$/i)
         if (stateHit) {
-          setDeviceState(parseDeviceState(stateHit[1]))
-          // Periodic AT+STATE? — update icon only, don't flood the log
+          const next = parseDeviceState(stateHit[1])
+          const prev = deviceStateRef.current
+          setDeviceState(next)
+          deviceStateRef.current = next
+          if (prev !== next) pushLog(line, 'rx')
+          return
+        }
+
+        // Intermediate URCs (+TTS:<n>, +READY, +ERROR:…) — final OK/ERROR resolves waiter
+        if (/^\+TTS:/i.test(line) || /^\+READY$/i.test(line) || /^\+ERROR:/i.test(line)) {
+          pushLog(line, 'rx')
           return
         }
 
         if (/^OK$/i.test(line)) {
-          const consumed = resolveAtReply(true)
-          if (!consumed) return // trailing OK from STATE poll
+          const kind = resolveAtReply(true)
+          if (kind !== 'loud') return // no waiter, or quiet poll
         } else if (/^ERROR$/i.test(line)) {
-          resolveAtReply(false, 'ERROR')
+          const kind = resolveAtReply(false, 'ERROR')
+          if (kind === 'quiet') return
         }
 
-        // Quiet DOA poll: skip flooding the log with ANGLE replies / OK
-        if (doaPollingRef.current && (/^\+?ANGLE:/i.test(line) || /^OK$/i.test(line))) return
+        // Quiet DOA poll: skip flooding the log with ANGLE replies
+        if (doaPollingRef.current && /^\+?ANGLE:/i.test(line)) return
 
         pushLog(line, 'rx')
       }),
@@ -529,7 +571,7 @@ export default function App() {
       return { ok: false, error: t(locale, 'waitModuleInit') }
     }
 
-    const pending = waitForAtReply(opts?.timeoutMs ?? 4000)
+    const pending = waitForAtReply(opts?.timeoutMs ?? 4000, Boolean(opts?.quiet))
     const res = await api.sendCmd(line)
     if (!res.ok) {
       cancelLastAtWaiter()

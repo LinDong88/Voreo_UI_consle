@@ -13,7 +13,8 @@ function isPunctChar(ch: string): boolean {
 }
 
 /**
- * Split UTF-8 text into packets ≤ maxBytes, preferring punctuation boundaries.
+ * Split UTF-8 text into packets ≤ maxBytes.
+ * Prefer punctuation/whitespace boundaries only when a packet hits the byte limit.
  */
 export function splitTtsPackets(text: string, maxBytes = TTS_PACKET_MAX): string[] {
   const src = text.replace(/\r?\n/g, ' ').trim()
@@ -43,9 +44,13 @@ export function splitTtsPackets(text: string, maxBytes = TTS_PACKET_MAX): string
       continue
     }
 
-    const minKeep = Math.max(1, Math.floor((end - offset) / 4))
-    if (lastPunctEnd > offset + minKeep && lastPunctEnd < src.length) {
-      end = lastPunctEnd
+    // Only back up to punctuation when this packet filled to the byte limit
+    const hitLimit = end < src.length
+    if (hitLimit) {
+      const minKeep = Math.max(1, Math.floor((end - offset) / 4))
+      if (lastPunctEnd > offset + minKeep) {
+        end = lastPunctEnd
+      }
     }
 
     packets.push(src.slice(offset, end))

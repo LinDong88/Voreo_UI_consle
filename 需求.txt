@@ -40,9 +40,9 @@
   - AT+SPD=<0~15> / AT+SPD?     语速设置 / 查询
   - AT+ANGLE?                   读 DOA 角度 → +ANGLE:<deg>
   - AT+WAKEWORD=<word> / ?      设/查英文唤醒词（恢复默认 HI ESP）
-  - AT+STATE?                   设备 RGB 状态英文名（BOOTING/STANDBY/LISTENING/TTS/…）
-  - 成功末行 OK，失败末行 ERROR
-  - 串口卡片右侧图标显示 AT+STATE? 状态（色点对齐设备 RGB）
+  - 连接后默认 BOOTING，每 1s AT+STATE?；收到就绪 STATE（查询或主动上报）后停止轮询，之后靠 URC；亦可手动刷新
+  - 成功：+VOL:/+SPD:/+TTS:/… → OK；失败：+ERROR:… → ERROR
+  - 串口卡片右侧图标跟随 STATE URC（色点对齐设备 RGB）
 
 【大模型】
   - 可配置 API 地址 / Key / 模型，保存到本地

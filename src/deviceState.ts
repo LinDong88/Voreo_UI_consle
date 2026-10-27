@@ -1,4 +1,4 @@
-/** Device RGB / AT+STATE? English names (UsbVcom + RgbIndicator). */
+/** Device RGB / STATE URC English names (UsbVcom + RgbIndicator). */
 export type DeviceStateName =
   | 'BOOTING'
   | 'STANDBY'
@@ -59,4 +59,9 @@ export function deviceStateMeta(name: DeviceStateName | null): DeviceStateMeta {
 export function isModuleReady(state: DeviceStateName | null): boolean {
   if (!state) return false
   return state !== 'BOOTING' && state !== 'BOOT_FAIL' && state !== 'UNKNOWN'
+}
+
+/** Still waiting for first real state — keep AT+STATE? poll. */
+export function isStateInitPending(state: DeviceStateName | null): boolean {
+  return !state || state === 'BOOTING' || state === 'UNKNOWN'
 }
