@@ -1,9 +1,11 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { ensureVoreoApi } from './bridge'
 import { DeviceSettings, DeviceSettingsState } from './components/DeviceSettings'
+import { DeviceStateIcon } from './components/DeviceStateIcon'
 import { DoaPanel } from './components/DoaPanel'
 import { LlmPanel } from './components/LlmPanel'
 import { WakeWordPanel } from './components/WakeWordPanel'
+import { DeviceStateName, isModuleReady, parseDeviceState } from './deviceState'
 import { Locale, t } from './i18n'
 import {
   askLlm,
@@ -13,6 +15,7 @@ import {
   loadLlmConfig,
   saveLlmConfig,
 } from './llm'
+import { splitTtsPackets, TTS_TOTAL_MAX, utf8ByteLength } from './ttsPacket'
 import type { SerialPortInfo } from './vite-env'
 
 type ChatItem = {
@@ -74,7 +77,9 @@ export default function App() {
   const [connected, setConnected] = useState(false)
   const [activePath, setActivePath] = useState<string | null>(null)
   const [version, setVersion] = useState<string | null>(null)
-  const [listening, setListening] = useState(false)
+  const [deviceState, setDeviceState] = useState<DeviceStateName | null>(null)
+  const [initDots, setInitDots] = useState('')
+  const deviceStateRef = useRef<DeviceStateName | null>(null)
   const [ttsText, setTtsText] = useState('')
   const [chat, setChat] = useState<ChatItem[]>([])
   const [logs, setLogs] = useState<LogItem[]>([])
@@ -92,7 +97,6 @@ export default function App() {
   const [doaPolling, setDoaPolling] = useState(false)
 
   const asrEndRef = useRef<HTMLDivElement | null>(null)
-  const wakeTimer = useRef<number | null>(null)
   const llmAbort = useRef<AbortController | null>(null)
   const turnId = useRef(0)
   const localeRef = useRef(locale)
@@ -113,8 +117,31 @@ export default function App() {
   }, [llm])
   useEffect(() => {
     connectedRef.current = connected
-    if (!connected) setDoaPolling(false)
+    if (!connected) {
+      setDoaPolling(false)
+      setDeviceState(null)
+      deviceStateRef.current = null
+    }
   }, [connected])
+
+  useEffect(() => {
+    deviceStateRef.current = deviceState
+  }, [deviceState])
+
+  useEffect(() => {
+    if (!connected || !api) return
+    let cancelled = false
+    const tick = async () => {
+      if (cancelled || !connectedRef.current || atWaiters.current.length > 0) return
+      await api.sendCmd('AT+STATE?')
+    }
+    void tick()
+    const id = window.setInterval(() => void tick(), 1000)
+    return () => {
+      cancelled = true
+      window.clearInterval(id)
+    }
+  }, [connected, api])
 
   useEffect(() => {
     doaPollingRef.current = doaPolling
@@ -136,7 +163,7 @@ export default function App() {
     }
 
     tick()
-    const id = window.setInterval(tick, 200)
+    const id = window.setInterval(tick, 100)
     return () => window.clearInterval(id)
   }, [doaPolling, api])
 
@@ -158,8 +185,12 @@ export default function App() {
     return () => window.clearTimeout(id)
   }, [toast])
 
-  function pushLog(line: string) {
-    setLogs((prev) => [...prev.slice(-100), { id: nowId(), line, at: Date.now() }])
+  function pushLog(line: string, dir: 'tx' | 'rx' | 'sys' = 'sys') {
+    const tag = dir === 'tx' ? 'TX' : dir === 'rx' ? 'RX' : 'SYS'
+    setLogs((prev) => [
+      ...prev.slice(-100),
+      { id: nowId(), line: `${tag}  ${line}`, at: Date.now() },
+    ])
   }
 
   function flashToast(text: string, tone?: 'ok' | 'fail') {
@@ -197,43 +228,54 @@ export default function App() {
   }
 
   async function playTts(text: string, kind: ChatItem['kind'] = 'tts') {
-    if (!api || !connectedRef.current) {
-      flashToast(t(localeRef.current, 'notConnected'), 'fail')
-      return false
-    }
-    const payload = text.trim()
+    if (!api || !ensureModuleReady()) return false
+    const payload = text.replace(/\r?\n/g, ' ').trim()
     if (!payload) return false
+
+    if (utf8ByteLength(payload) > TTS_TOTAL_MAX) {
+      flashToast(t(localeRef.current, 'ttsTooLong'), 'fail')
+      return false
+    }
+
+    const packets = splitTtsPackets(payload)
+    if (packets.length === 0) return false
+
     setSending(true)
-    const pending = waitForAtReply(60000)
-    const res = await api.sendTts(payload)
-    if (!res.ok) {
-      cancelLastAtWaiter()
+    try {
+      for (let i = 0; i < packets.length; i++) {
+        const chunk = packets[i]
+        const pending = waitForAtReply(15000)
+        const res = await api.sendTts(chunk)
+        if (!res.ok) {
+          cancelLastAtWaiter()
+          flashToast(res.error || t(localeRef.current, 'sendFailed'), 'fail')
+          return false
+        }
+        pushLog(`AT+TTS=[${i + 1}/${packets.length}] ${chunk}`, 'tx')
+        const reply = await pending
+        if (!reply.ok) {
+          const msg =
+            reply.error === 'timeout'
+              ? t(localeRef.current, 'cmdTimeout')
+              : t(localeRef.current, 'ttsPacketFail')
+          flashToast(msg, 'fail')
+          return false
+        }
+      }
+      setChat((prev) => [...prev, { id: nowId(), kind, text: payload, at: Date.now() }])
+      flashToast(t(localeRef.current, 'ttsOk'), 'ok')
+      return true
+    } finally {
       setSending(false)
-      flashToast(res.error || t(localeRef.current, 'sendFailed'), 'fail')
-      return false
     }
-    pushLog(`AT+TTS=${payload}`)
-    const reply = await pending
-    setSending(false)
-    if (!reply.ok) {
-      const msg =
-        reply.error === 'timeout'
-          ? t(localeRef.current, 'cmdTimeout')
-          : t(localeRef.current, 'cmdFail')
-      flashToast(msg, 'fail')
-      return false
-    }
-    setChat((prev) => [...prev, { id: nowId(), kind, text: payload, at: Date.now() }])
-    flashToast(t(localeRef.current, 'ttsOk'), 'ok')
-    return true
   }
 
   async function syncDeviceState() {
     if (!api) return
-    for (const line of ['AT+VER?', 'AT+VOL?', 'AT+SPD?', 'AT+WAKEWORD?']) {
+    for (const line of ['AT+VER?', 'AT+VOL?', 'AT+SPD?', 'AT+WAKEWORD?', 'AT+STATE?']) {
       const pending = waitForAtReply(4000)
       const res = await api.sendCmd(line)
-      pushLog(res.ok ? `CMD>${line}` : `CMD ERR ${line}`)
+      pushLog(res.ok ? line : `ERR ${line}`, res.ok ? 'tx' : 'sys')
       if (!res.ok) {
         cancelLastAtWaiter()
         continue
@@ -256,14 +298,14 @@ export default function App() {
       let reply: string
       let kind: ChatItem['kind'] = 'llm'
       if (isLlmConfigured(cfg)) {
-        pushLog('LLM> request')
+        pushLog('LLM request', 'sys')
         reply = await askLlm(cfg, asrText, ac.signal)
       } else if (cfg.useDemoReply) {
         reply = demoReply(localeRef.current, asrText)
         kind = 'sys'
-        pushLog('LLM> demo')
+        pushLog('LLM demo', 'sys')
       } else {
-        pushLog('LLM> skipped (demo off)')
+        pushLog('LLM skipped (demo off)', 'sys')
         return
       }
       if (myTurn !== turnId.current || ac.signal.aborted) return
@@ -272,7 +314,7 @@ export default function App() {
       if (ac.signal.aborted || myTurn !== turnId.current) return
       const msg = err instanceof Error ? err.message : String(err)
       setToast(`${t(localeRef.current, 'llmFailed')}: ${msg}`)
-      pushLog(`LLM ERR ${msg}`)
+      pushLog(`LLM ERR ${msg}`, 'sys')
     } finally {
       if (myTurn === turnId.current) setLlmBusy(false)
     }
@@ -283,7 +325,7 @@ export default function App() {
     llmAbort.current?.abort()
     llmAbort.current = null
     setLlmBusy(false)
-    pushLog('CMD> TTS_STOP (placeholder)')
+    pushLog('TTS_STOP (placeholder)', 'sys')
     setToast(t(locale, 'llmStopped'))
     setChat((prev) => [
       ...prev,
@@ -308,20 +350,18 @@ export default function App() {
         setActivePath(status.path)
         if (status.connected && status.path) {
           setSelectedPath(status.path)
-          pushLog(`connected ${status.path}`)
+          pushLog(`connected ${status.path}`, 'sys')
           void syncDeviceState()
         } else if (!status.connected) {
-          setListening(false)
-          pushLog('disconnected')
+          pushLog('disconnected', 'sys')
         }
         if (status.error) {
           setToast(status.error)
-          pushLog(`error: ${status.error}`)
+          pushLog(`error: ${status.error}`, 'sys')
         }
       }),
       api.onAsr(({ text }) => {
         const content = String(text ?? '').trim()
-        setListening(false)
         setChat((prev) => [
           ...prev,
           {
@@ -334,9 +374,7 @@ export default function App() {
         if (content) void handleAsrReply(content)
       }),
       api.onWake(() => {
-        setListening(true)
-        if (wakeTimer.current) window.clearTimeout(wakeTimer.current)
-        wakeTimer.current = window.setTimeout(() => setListening(false), 8000)
+        /* wake reflected via AT+STATE? → LISTENING */
       }),
       api.onVersion(({ version: ver }) => {
         setVersion(ver)
@@ -365,13 +403,24 @@ export default function App() {
           if (word) setWakeCurrent(word)
         }
 
-        if (/^OK$/i.test(line)) resolveAtReply(true)
-        else if (/^ERROR$/i.test(line)) resolveAtReply(false, 'ERROR')
+        const stateHit = line.match(/^\+STATE:\s*(.*)$/i)
+        if (stateHit) {
+          setDeviceState(parseDeviceState(stateHit[1]))
+          // Periodic AT+STATE? — update icon only, don't flood the log
+          return
+        }
 
-        // Quiet poll: skip flooding the log with ANGLE replies / OK
+        if (/^OK$/i.test(line)) {
+          const consumed = resolveAtReply(true)
+          if (!consumed) return // trailing OK from STATE poll
+        } else if (/^ERROR$/i.test(line)) {
+          resolveAtReply(false, 'ERROR')
+        }
+
+        // Quiet DOA poll: skip flooding the log with ANGLE replies / OK
         if (doaPollingRef.current && (/^\+?ANGLE:/i.test(line) || /^OK$/i.test(line))) return
 
-        pushLog(line)
+        pushLog(line, 'rx')
       }),
       api.onDoa?.(({ angle: a }) => {
         if (typeof a === 'number') setAngle(a)
@@ -391,16 +440,46 @@ export default function App() {
 
     return () => {
       unsubs.forEach((u) => u?.())
-      if (wakeTimer.current) window.clearTimeout(wakeTimer.current)
     }
   }, [api])
 
+  const moduleReady = connected && isModuleReady(deviceState)
+
+  useEffect(() => {
+    if (!moduleReady && doaPolling) setDoaPolling(false)
+  }, [moduleReady, doaPolling])
+
+  const showInitWait = connected && !moduleReady
+
+  useEffect(() => {
+    if (!showInitWait) {
+      setInitDots('')
+      return
+    }
+    flashToast(t(localeRef.current, 'waitModuleInit'), 'fail')
+    setInitDots('')
+    const id = window.setInterval(() => {
+      setInitDots((prev) => (prev.length >= 3 ? '' : `${prev}.`))
+    }, 500)
+    return () => window.clearInterval(id)
+  }, [showInitWait])
+
   const statusLabel = useMemo(() => {
-    if (llmBusy) return t(locale, 'llmThinking')
-    if (listening) return t(locale, 'wakeHint')
     if (connected) return t(locale, 'connected')
-    return hasApi ? t(locale, 'scanning') : t(locale, 'disconnected')
-  }, [connected, listening, locale, hasApi, llmBusy])
+    return t(locale, 'disconnected')
+  }, [connected, locale])
+
+  function ensureModuleReady(): boolean {
+    if (!connectedRef.current) {
+      flashToast(t(localeRef.current, 'notConnected'), 'fail')
+      return false
+    }
+    if (!isModuleReady(deviceStateRef.current)) {
+      flashToast(t(localeRef.current, 'waitModuleInit'), 'fail')
+      return false
+    }
+    return true
+  }
 
   async function handleConnect() {
     if (!api || !selectedPath) return
@@ -410,7 +489,16 @@ export default function App() {
 
   async function handleDisconnect() {
     if (!api) return
-    await api.disconnect()
+    setDoaPolling(false)
+    while (atWaiters.current.length) cancelLastAtWaiter()
+    const res = await api.disconnect()
+    if (res.ok) {
+      setConnected(false)
+      setActivePath(null)
+      flashToast(t(locale, 'disconnectedOk'), 'ok')
+    } else {
+      flashToast(t(locale, 'sendFailed'), 'fail')
+    }
   }
 
   async function sendManualTts(raw: string) {
@@ -435,6 +523,11 @@ export default function App() {
       if (!opts?.quiet) flashToast(t(locale, 'notConnected'), 'fail')
       return { ok: false, error: t(locale, 'notConnected') }
     }
+    const isStateQuery = /^AT\+STATE\??$/i.test(line.trim())
+    if (!isStateQuery && !isModuleReady(deviceStateRef.current)) {
+      if (!opts?.quiet) flashToast(t(locale, 'waitModuleInit'), 'fail')
+      return { ok: false, error: t(locale, 'waitModuleInit') }
+    }
 
     const pending = waitForAtReply(opts?.timeoutMs ?? 4000)
     const res = await api.sendCmd(line)
@@ -442,12 +535,12 @@ export default function App() {
       cancelLastAtWaiter()
       if (!opts?.quiet) {
         flashToast(res.error || t(locale, 'sendFailed'), 'fail')
-        pushLog(`CMD ERR ${line}`)
+        pushLog(`ERR ${line}`, 'sys')
       }
       return { ok: false, error: res.error || t(locale, 'sendFailed') }
     }
 
-    if (!opts?.quiet) pushLog(`CMD>${line}`)
+    if (!opts?.quiet) pushLog(line, 'tx')
     const reply = await pending
     if (!opts?.quiet) {
       if (reply.ok) {
@@ -456,7 +549,7 @@ export default function App() {
         const msg =
           reply.error === 'timeout' ? t(locale, 'cmdTimeout') : t(locale, 'cmdFail')
         flashToast(msg, 'fail')
-        pushLog(`CMD FAIL ${line}`)
+        pushLog(`FAIL ${line}`, 'sys')
       }
     }
     return reply
@@ -472,7 +565,7 @@ export default function App() {
     setCmdBusy(true)
     try {
       const vol = await sendDeviceCmd(`AT+VOL=${next.volume}`, { quiet: true })
-      pushLog(`CMD>AT+VOL=${next.volume}`)
+      pushLog(`AT+VOL=${next.volume}`, 'tx')
       if (!vol.ok) {
         flashToast(
           vol.error === 'timeout' ? t(locale, 'cmdTimeout') : t(locale, 'cmdFail'),
@@ -481,7 +574,7 @@ export default function App() {
         return
       }
       const spd = await sendDeviceCmd(`AT+SPD=${next.speed}`, { quiet: true })
-      pushLog(`CMD>AT+SPD=${next.speed}`)
+      pushLog(`AT+SPD=${next.speed}`, 'tx')
       if (!spd.ok) {
         flashToast(
           spd.error === 'timeout' ? t(locale, 'cmdTimeout') : t(locale, 'cmdFail'),
@@ -538,13 +631,13 @@ export default function App() {
     saveLlmConfig(llm)
     if (isLlmConfigured(llm)) {
       setToast(t(locale, 'llmReady'))
-      pushLog('LLM config saved')
+      pushLog('LLM config saved', 'sys')
     } else if (llm.useDemoReply) {
       setToast(t(locale, 'llmDemo'))
-      pushLog('LLM demo mode')
+      pushLog('LLM demo mode', 'sys')
     } else {
       setToast(t(locale, 'llmIdle'))
-      pushLog('LLM idle (demo off)')
+      pushLog('LLM idle (demo off)', 'sys')
     }
   }
 
@@ -579,10 +672,16 @@ export default function App() {
         <div className="main-col">
           <section className="card asr-card card-pad">
             <div className="card-head">
-              <h2 className="section-title">{t(locale, 'asrTitle')}</h2>
-              <div className={`pill compact`}>
-                <span className={`dot ${llmBusy ? 'wake' : listening ? 'wake' : connected ? 'on' : ''}`} />
-                {statusLabel}
+              <div className="card-head-left">
+                <h2 className="section-title">{t(locale, 'asrTitle')}</h2>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  disabled={chat.length === 0}
+                  onClick={() => setChat([])}
+                >
+                  {t(locale, 'clearChat')}
+                </button>
               </div>
             </div>
             <div className="asr-stream">
@@ -631,22 +730,12 @@ export default function App() {
                 <button
                   type="submit"
                   className="btn btn-primary"
-                  disabled={sending || !ttsText.trim()}
+                  disabled={sending || !ttsText.trim() || (connected && !moduleReady)}
                 >
                   {t(locale, 'speak')}
                 </button>
                 <button type="button" className="btn btn-ghost danger" onClick={stopOrInterrupt}>
                   {t(locale, 'stopTts')}
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  onClick={() => {
-                    setChat([])
-                    setLogs([])
-                  }}
-                >
-                  {t(locale, 'clear')}
                 </button>
               </div>
             </form>
@@ -658,27 +747,50 @@ export default function App() {
             onRefresh={() => void refreshAngle()}
             polling={doaPolling}
             onTogglePoll={() => {
-              if (!connectedRef.current) {
-                flashToast(t(locale, 'notConnected'), 'fail')
-                return
-              }
+              if (!ensureModuleReady()) return
               setDoaPolling((v) => !v)
             }}
-            busy={cmdBusy}
+            busy={cmdBusy || (connected && !moduleReady)}
           />
         </div>
 
         <aside className="side-col">
           <section className="card status-card card-pad">
-            <div className="meta">
-              <div>
-                {t(locale, 'port')}: <strong>{activePath || selectedPath || '—'}</strong>
+            <div className="status-top">
+              <div className="meta">
+                <div>
+                  {t(locale, 'port')}: <strong>{activePath || selectedPath || '—'}</strong>
+                </div>
+                <div>
+                  {t(locale, 'version')}: <strong>{version || '—'}</strong>
+                </div>
+                <p className="hint">{t(locale, 'autoDetect')}</p>
               </div>
-              <div>
-                {t(locale, 'version')}: <strong>{version || '—'}</strong>
+              <div className="status-badges">
+                <div className="pill compact">
+                  <span className={`dot ${connected ? 'on' : ''}`} />
+                  {statusLabel}
+                </div>
+                <DeviceStateIcon
+                  locale={locale}
+                  state={connected ? deviceState : null}
+                  busy={!connected}
+                  onRefresh={() => {
+                    if (!connected) return
+                    void sendDeviceCmd('AT+STATE?', { quiet: true })
+                  }}
+                />
               </div>
-              <p className="hint">{t(locale, 'autoDetect')}</p>
             </div>
+
+            {showInitWait ? (
+              <p className="init-banner" role="status">
+                {t(locale, 'waitModuleInit')}
+                <span className="init-dots" aria-hidden>
+                  {initDots}
+                </span>
+              </p>
+            ) : null}
 
             <div className="port-row">
               <select
@@ -743,7 +855,7 @@ export default function App() {
                 value={device}
                 onChange={setDevice}
                 onApply={() => void applyDeviceSettings()}
-                busy={cmdBusy}
+                busy={cmdBusy || (connected && !moduleReady)}
               />
               <WakeWordPanel
                 locale={locale}
@@ -751,7 +863,7 @@ export default function App() {
                 draft={wakeDraft}
                 onDraft={setWakeDraft}
                 onAction={(action) => void onWakeAction(action)}
-                busy={cmdBusy}
+                busy={cmdBusy || (connected && !moduleReady)}
               />
             </div>
           ) : (
@@ -759,7 +871,17 @@ export default function App() {
           )}
 
           <section className="card card-pad log-card">
-            <h2 className="section-title">{t(locale, 'logTitle')}</h2>
+            <div className="card-head">
+              <h2 className="section-title">{t(locale, 'logTitle')}</h2>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                disabled={logs.length === 0}
+                onClick={() => setLogs([])}
+              >
+                {t(locale, 'clearLog')}
+              </button>
+            </div>
             <div className="log-list">
               {logs.length === 0 ? (
                 <div className="log-line">—</div>

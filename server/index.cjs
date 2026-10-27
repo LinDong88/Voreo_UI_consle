@@ -14,6 +14,8 @@ const isDev = process.env.NODE_ENV !== 'production'
 let port = null
 let rxBuffer = ''
 let intentionalClose = false
+/** When false, periodic auto-connect is paused (user clicked Disconnect). */
+let autoConnectEnabled = true
 /** @type {Set<import('ws').WebSocket>} */
 const clients = new Set()
 
@@ -164,6 +166,7 @@ function openPort(portPath) {
 }
 
 async function autoConnect() {
+  if (!autoConnectEnabled) return
   if (port?.isOpen) return
   try {
     const ports = await listPorts()
@@ -276,11 +279,13 @@ wss.on('connection', (ws) => {
       return
     }
     if (msg.type === 'connect') {
+      autoConnectEnabled = true
       const result = await openPort(msg.path)
       ws.send(JSON.stringify({ type: 'result', action: 'connect', ...result }))
       return
     }
     if (msg.type === 'disconnect') {
+      autoConnectEnabled = false
       intentionalClose = true
       detachPort()
       intentionalClose = false

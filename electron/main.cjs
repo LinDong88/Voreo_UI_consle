@@ -14,6 +14,7 @@ let port = null
 let scanTimer = null
 let rxBuffer = ''
 let intentionalClose = false
+let autoConnectEnabled = true
 
 function send(channel, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -149,6 +150,7 @@ async function openPort(portPath) {
 }
 
 async function autoConnect() {
+  if (!autoConnectEnabled) return
   if (port?.isOpen) return
 
   try {
@@ -233,10 +235,12 @@ ipcMain.handle('serial:list', async () => listPorts())
 
 ipcMain.handle('serial:connect', async (_event, portPath) => {
   if (!portPath) return { ok: false, error: 'No port' }
+  autoConnectEnabled = true
   return openPort(portPath)
 })
 
 ipcMain.handle('serial:disconnect', async () => {
+  autoConnectEnabled = false
   intentionalClose = true
   detachPort()
   intentionalClose = false

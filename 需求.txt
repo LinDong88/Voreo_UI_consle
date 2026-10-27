@@ -31,7 +31,8 @@
   - +WAKE     唤醒
   - +ASR:<text>  识别文字 → 对话区
   - +VER:<ver>   版本通知
-  - 手动 TTS：AT+TTS=<utf8>
+  - 手动 TTS：AT+TTS=<utf8>（主机按 ≤128B 标点分包连发；全文 UTF-8 ≤2KB，超限提示且不发送）
+  - 断开后不再自动重连，需手动点「连接」
   - 停止 / 打断本轮 LLM 回复（上位机侧）
 
 【设备 AT 命令】
@@ -39,7 +40,9 @@
   - AT+SPD=<0~15> / AT+SPD?     语速设置 / 查询
   - AT+ANGLE?                   读 DOA 角度 → +ANGLE:<deg>
   - AT+WAKEWORD=<word> / ?      设/查英文唤醒词（恢复默认 HI ESP）
+  - AT+STATE?                   设备 RGB 状态英文名（BOOTING/STANDBY/LISTENING/TTS/…）
   - 成功末行 OK，失败末行 ERROR
+  - 串口卡片右侧图标显示 AT+STATE? 状态（色点对齐设备 RGB）
 
 【大模型】
   - 可配置 API 地址 / Key / 模型，保存到本地
