@@ -99,6 +99,8 @@ export default function App() {
   const asrEndRef = useRef<HTMLDivElement | null>(null)
   const llmAbort = useRef<AbortController | null>(null)
   const turnId = useRef(0)
+  /** Set by AT+STOP to abort in-flight playTts packet loop */
+  const ttsAbortRef = useRef(false)
   const localeRef = useRef(locale)
   const llmRef = useRef(llm)
   const connectedRef = useRef(connected)
@@ -267,21 +269,25 @@ export default function App() {
     const packets = splitTtsPackets(payload)
     if (packets.length === 0) return false
 
+    ttsAbortRef.current = false
     setSending(true)
     setDeviceState('TTS')
     try {
       for (let i = 0; i < packets.length; i++) {
+        if (ttsAbortRef.current) return false
         const chunk = packets[i]
-        // +TTS:<n> / +STATE:TTS 仅为中间 URC；等最终 OK 再发下一包
+        // 等 OK 再发下一包；AT+STOP 会 cancel waiter 并置 ttsAbortRef
         const pending = waitForAtReply(15000)
         const res = await api.sendTts(chunk)
         if (!res.ok) {
           cancelLastAtWaiter()
+          if (ttsAbortRef.current) return false
           flashToast(res.error || t(localeRef.current, 'sendFailed'), 'fail')
           return false
         }
         pushLog(`AT+TTS=[${i + 1}/${packets.length}] ${chunk}`, 'tx')
         const reply = await pending
+        if (ttsAbortRef.current || (!reply.ok && reply.error === 'cancelled')) return false
         if (!reply.ok) {
           const msg =
             reply.error === 'timeout'
@@ -291,6 +297,7 @@ export default function App() {
           return false
         }
       }
+      if (ttsAbortRef.current) return false
       setChat((prev) => [...prev, { id: nowId(), kind, text: payload, at: Date.now() }])
       flashToast(t(localeRef.current, 'ttsOk'), 'ok')
       return true
@@ -349,17 +356,44 @@ export default function App() {
     }
   }
 
-  function stopOrInterrupt() {
+  async function stopOrInterrupt() {
     turnId.current += 1
+    ttsAbortRef.current = true
     llmAbort.current?.abort()
     llmAbort.current = null
     setLlmBusy(false)
-    pushLog('TTS_STOP (placeholder)', 'sys')
-    setToast(t(locale, 'llmStopped'))
-    setChat((prev) => [
-      ...prev,
-      { id: nowId(), kind: 'sys', text: t(locale, 'llmStopped'), at: Date.now() },
-    ])
+    setSending(false)
+
+    // Unblock playTts waiting on OK, then send AT+STOP
+    while (atWaiters.current.length) cancelLastAtWaiter()
+
+    if (!api || !connectedRef.current) {
+      flashToast(t(locale, 'notConnected'), 'fail')
+      return
+    }
+
+    const pending = waitForAtReply(4000)
+    const res = await api.sendCmd('AT+STOP')
+    if (!res.ok) {
+      cancelLastAtWaiter()
+      flashToast(res.error || t(locale, 'sendFailed'), 'fail')
+      pushLog('ERR AT+STOP', 'sys')
+      return
+    }
+    pushLog('AT+STOP', 'tx')
+    const reply = await pending
+    if (reply.ok) {
+      flashToast(t(locale, 'ttsStopped'), 'ok')
+      setChat((prev) => [
+        ...prev,
+        { id: nowId(), kind: 'sys', text: t(locale, 'ttsStopped'), at: Date.now() },
+      ])
+    } else {
+      const msg =
+        reply.error === 'timeout' ? t(locale, 'cmdTimeout') : t(locale, 'cmdFail')
+      flashToast(msg, 'fail')
+      pushLog('FAIL AT+STOP', 'sys')
+    }
   }
 
   useEffect(() => {
@@ -776,7 +810,11 @@ export default function App() {
                 >
                   {t(locale, 'speak')}
                 </button>
-                <button type="button" className="btn btn-ghost danger" onClick={stopOrInterrupt}>
+                <button
+                  type="button"
+                  className="btn btn-ghost danger"
+                  onClick={() => void stopOrInterrupt()}
+                >
                   {t(locale, 'stopTts')}
                 </button>
               </div>

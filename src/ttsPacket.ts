@@ -1,5 +1,5 @@
-/** Align with firmware VOREO_TTS_PAYLOAD_MAX / host policy */
-export const TTS_PACKET_MAX = 128
+/** Host TTS packet size (leave margin under firmware 128B max) */
+export const TTS_PACKET_MAX = 120
 export const TTS_TOTAL_MAX = 2048
 
 const encoder = new TextEncoder()
@@ -8,8 +8,9 @@ export function utf8ByteLength(text: string): number {
   return encoder.encode(text).length
 }
 
+/** Prefer cut after these when a packet nears the byte limit */
 function isPunctChar(ch: string): boolean {
-  return /[，。！？；、,.!?;:\s…—\-]/.test(ch)
+  return /[，。！？；、：,.!?;:\s…—\-《》〈〉「」『』""''（）()]/.test(ch)
 }
 
 /**

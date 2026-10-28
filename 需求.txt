@@ -31,15 +31,16 @@
   - +WAKE     唤醒
   - +ASR:<text>  识别文字 → 对话区
   - +VER:<ver>   版本通知
-  - 手动 TTS：AT+TTS=<utf8>（主机按 ≤128B 标点分包连发；全文 UTF-8 ≤2KB，超限提示且不发送）
+  - 手动 TTS：AT+TTS=<utf8>（主机按 ≤120B、靠近标点切包连发；全文 UTF-8 ≤2KB；段间等设备 OK）
   - 断开后不再自动重连，需手动点「连接」
-  - 停止 / 打断本轮 LLM 回复（上位机侧）
+  - 停止 / 打断：发 AT+STOP，取消剩余 TTS 分包与本轮 LLM，等 OK
 
 【设备 AT 命令】
   - AT+VOL=<0~15> / AT+VOL?     音量设置 / 查询
   - AT+SPD=<0~15> / AT+SPD?     语速设置 / 查询
   - AT+ANGLE?                   读 DOA 角度 → +ANGLE:<deg>
   - AT+WAKEWORD=<word> / ?      设/查英文唤醒词（恢复默认 HI ESP）
+  - AT+STOP                     打断 ASR/TTS 播报 → OK
   - 连接后默认 BOOTING，每 1s AT+STATE?；收到就绪 STATE（查询或主动上报）后停止轮询，之后靠 URC；亦可手动刷新
   - 成功：+VOL:/+SPD:/+TTS:/… → OK；失败：+ERROR:… → ERROR
   - 串口卡片右侧图标跟随 STATE URC（色点对齐设备 RGB）
