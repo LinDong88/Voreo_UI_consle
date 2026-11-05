@@ -15,7 +15,7 @@ import {
   loadLlmConfig,
   saveLlmConfig,
 } from './llm'
-import { splitForAtLine, TTS_TOTAL_MAX, utf8ByteLength } from './ttsPacket'
+import { splitForAtLine, utf8ByteLength } from './ttsPacket'
 import type { SerialPortInfo } from './vite-env'
 
 type ChatItem = {
@@ -101,9 +101,13 @@ export default function App() {
   const turnId = useRef(0)
   /** Set by AT+STOP to abort in-flight playTts */
   const ttsAbortRef = useRef(false)
-  /** Firmware +TTS:PAUSE / +TTS:RESUME — 高水位暂停喂入 */
+  /** Firmware +TTS:PAUSE / +TTS:RESUME / +TTS:Q paused — 高水位暂停喂入 */
   const ttsPausedRef = useRef(false)
   const ttsResumeWaiters = useRef<Array<() => void>>([])
+  /** +TTS:Q:<used>,<free>,<paused> */
+  const ttsQRef = useRef<{ used: number; free: number; paused: boolean } | null>(null)
+  /** 最近一次 +ERROR:TTS_*，供裸 ERROR 解析 waiter */
+  const ttsLastErrorRef = useRef<string | null>(null)
   const localeRef = useRef(locale)
   const llmRef = useRef(llm)
   const connectedRef = useRef(connected)
@@ -264,19 +268,20 @@ export default function App() {
     for (const w of list) w()
   }
 
-  function waitTtsNotPaused(timeoutMs = 120000): Promise<boolean> {
-    if (!ttsPausedRef.current) return Promise.resolve(true)
-    return new Promise((resolve) => {
-      const timer = window.setTimeout(() => {
-        ttsResumeWaiters.current = ttsResumeWaiters.current.filter((w) => w !== onResume)
-        resolve(false)
-      }, timeoutMs)
-      const onResume = () => {
-        window.clearTimeout(timer)
-        resolve(true)
-      }
-      ttsResumeWaiters.current.push(onResume)
-    })
+  function setTtsPaused(paused: boolean) {
+    ttsPausedRef.current = paused
+    if (ttsQRef.current) ttsQRef.current = { ...ttsQRef.current, paused }
+    if (!paused) notifyTtsResumeWaiters()
+  }
+
+  /** paused 时每 1s 醒一次；可被 STOP 打断。返回 false = 已 abort */
+  async function sleepWhilePausedOrRetry(ms = 1000): Promise<boolean> {
+    const deadline = Date.now() + ms
+    while (Date.now() < deadline) {
+      if (ttsAbortRef.current) return false
+      await new Promise<void>((r) => window.setTimeout(r, Math.min(100, deadline - Date.now())))
+    }
+    return !ttsAbortRef.current
   }
 
   /**
@@ -285,8 +290,8 @@ export default function App() {
    */
   async function sendAtStop(opts?: { quiet?: boolean }): Promise<AtOutcome> {
     ttsAbortRef.current = true
-    ttsPausedRef.current = false
-    notifyTtsResumeWaiters()
+    setTtsPaused(false)
+    ttsQRef.current = null
     while (atWaiters.current.length) cancelLastAtWaiter()
 
     if (!api || !connectedRef.current) {
@@ -309,41 +314,43 @@ export default function App() {
   }
 
   /**
-   * 上位机不切 GTA 帧：整段/大块 AT+TTS 入 4KB 池；等 OK=入队。
-   * 跟 +TTS:PAUSE/RESUME，不跟模组 B1/AC。切包由固件 ≤127 完成。
-   * 单次文本 ≤4KB。
+   * 主机 ≤512B/包喂入；全文不限长。
+   * 跟 Q/PAUSE/RESUME；ERROR 分类：TOO_LONG 失败；PAUSE/FULL 等 RESUME 或 1s 重试。
    */
   async function playTts(text: string, kind: ChatItem['kind'] = 'tts') {
     if (!api || !ensureModuleReady()) return false
     const payload = text.replace(/\r?\n/g, ' ').trim()
     if (!payload) return false
 
-    if (utf8ByteLength(payload) > TTS_TOTAL_MAX) {
-      flashToast(t(localeRef.current, 'ttsTooLong'), 'fail')
-      return false
-    }
-
     const chunks = splitForAtLine(payload)
     if (chunks.length === 0) return false
 
     ttsAbortRef.current = false
+    ttsLastErrorRef.current = null
     setSending(true)
     setDeviceState('TTS')
     try {
       for (let i = 0; i < chunks.length; i++) {
         if (ttsAbortRef.current) return false
-        if (!(await waitTtsNotPaused())) {
-          if (ttsAbortRef.current) return false
-          flashToast(t(localeRef.current, 'ttsPacketFail'), 'fail')
-          return false
-        }
-        if (ttsAbortRef.current) return false
-
         const chunk = chunks[i]
-        let attempt = 0
+
         for (;;) {
-          attempt += 1
           if (ttsAbortRef.current) return false
+
+          if (ttsPausedRef.current || ttsQRef.current?.paused) {
+            pushLog('TTS paused, wait RESUME', 'sys')
+            if (!(await sleepWhilePausedOrRetry(1000))) return false
+            continue
+          }
+
+          const free = ttsQRef.current?.free
+          if (typeof free === 'number' && free > 0 && utf8ByteLength(chunk) > free) {
+            pushLog(`TTS wait free (${free}B < chunk)`, 'sys')
+            if (!(await sleepWhilePausedOrRetry(1000))) return false
+            continue
+          }
+
+          ttsLastErrorRef.current = null
           const pending = waitForAtReply(15000)
           const res = await api.sendTts(chunk)
           if (!res.ok) {
@@ -361,16 +368,20 @@ export default function App() {
           const reply = await pending
           if (ttsAbortRef.current || (!reply.ok && reply.error === 'cancelled')) return false
           if (reply.ok) break
-          /* 高水位 ERROR：等 RESUME 再重试本块 */
-          if (attempt >= 8) {
-            flashToast(t(localeRef.current, 'ttsPacketFail'), 'fail')
+
+          const err = reply.error || ttsLastErrorRef.current || 'ERROR'
+          if (/TTS_TOO_LONG/i.test(err)) {
+            flashToast(err, 'fail')
+            pushLog(`FAIL ${err}`, 'sys')
             return false
           }
-          pushLog('TTS queue busy, wait RESUME', 'sys')
-          if (!(await waitTtsNotPaused())) {
-            flashToast(t(localeRef.current, 'ttsPacketFail'), 'fail')
-            return false
+          if (/TTS_PAUSE/i.test(err)) {
+            setTtsPaused(true)
+            pushLog('TTS_PAUSE, wait RESUME', 'sys')
+          } else {
+            pushLog(`${err}, retry in 1s`, 'sys')
           }
+          if (!(await sleepWhilePausedOrRetry(1000))) return false
         }
       }
       if (ttsAbortRef.current) return false
@@ -547,29 +558,53 @@ export default function App() {
           return
         }
 
-        if (/^\+TTS:PAUSE\b/i.test(line)) {
-          ttsPausedRef.current = true
-          pushLog(line, 'rx')
-          return
-        }
-        if (/^\+TTS:RESUME\b/i.test(line)) {
-          ttsPausedRef.current = false
-          notifyTtsResumeWaiters()
+        // +TTS:Q:<used>,<free>,<paused> — 入队成败 / RESUME 前水位
+        const qHit = line.match(/^\+TTS:Q:(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\b/i)
+        if (qHit) {
+          const used = Number(qHit[1])
+          const free = Number(qHit[2])
+          const paused = Number(qHit[3]) !== 0
+          ttsQRef.current = { used, free, paused }
+          setTtsPaused(paused)
           pushLog(line, 'rx')
           return
         }
 
-        // Intermediate URCs (+TTS:…, +READY, +ERROR:…) — final OK/ERROR resolves waiter
+        if (/^\+TTS:PAUSE\b/i.test(line)) {
+          setTtsPaused(true)
+          pushLog(line, 'rx')
+          return
+        }
+        if (/^\+TTS:RESUME\b/i.test(line)) {
+          setTtsPaused(false)
+          pushLog(line, 'rx')
+          return
+        }
+
+        // +ERROR:TTS_* — 分类缓存，末行裸 ERROR 再 resolve waiter
+        const errHit = line.match(/^\+ERROR:(TTS_\w+)\b/i)
+        if (errHit) {
+          const code = errHit[1].toUpperCase()
+          ttsLastErrorRef.current = code
+          if (code === 'TTS_PAUSE') setTtsPaused(true)
+          pushLog(line, 'rx')
+          return
+        }
+
+        // Intermediate URCs (+TTS:…, +READY, 其它 +ERROR:…) — final OK/ERROR resolves waiter
         if (/^\+TTS:/i.test(line) || /^\+READY$/i.test(line) || /^\+ERROR:/i.test(line)) {
           pushLog(line, 'rx')
           return
         }
 
         if (/^OK$/i.test(line)) {
+          ttsLastErrorRef.current = null
           const kind = resolveAtReply(true)
           if (kind !== 'loud') return // no waiter, or quiet poll
         } else if (/^ERROR$/i.test(line)) {
-          const kind = resolveAtReply(false, 'ERROR')
+          const code = ttsLastErrorRef.current || 'ERROR'
+          ttsLastErrorRef.current = null
+          const kind = resolveAtReply(false, code)
           if (kind === 'quiet') return
         }
 
@@ -659,10 +694,6 @@ export default function App() {
     if (!ensureModuleReady()) return
     const payload = raw.replace(/\r?\n/g, ' ').trim()
     if (!payload) return
-    if (utf8ByteLength(payload) > TTS_TOTAL_MAX) {
-      flashToast(t(localeRef.current, 'ttsTooLong'), 'fail')
-      return
-    }
 
     turnId.current += 1
     llmAbort.current?.abort()
