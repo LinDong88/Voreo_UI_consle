@@ -15,7 +15,7 @@ import {
   loadLlmConfig,
   saveLlmConfig,
 } from './llm'
-import { splitTtsPackets, TTS_TOTAL_MAX, utf8ByteLength } from './ttsPacket'
+import { splitForAtLine, TTS_TOTAL_MAX, utf8ByteLength } from './ttsPacket'
 import type { SerialPortInfo } from './vite-env'
 
 type ChatItem = {
@@ -99,8 +99,11 @@ export default function App() {
   const asrEndRef = useRef<HTMLDivElement | null>(null)
   const llmAbort = useRef<AbortController | null>(null)
   const turnId = useRef(0)
-  /** Set by AT+STOP to abort in-flight playTts packet loop */
+  /** Set by AT+STOP to abort in-flight playTts */
   const ttsAbortRef = useRef(false)
+  /** Firmware +TTS:PAUSE / +TTS:RESUME — 高水位暂停喂入 */
+  const ttsPausedRef = useRef(false)
+  const ttsResumeWaiters = useRef<Array<() => void>>([])
   const localeRef = useRef(locale)
   const llmRef = useRef(llm)
   const connectedRef = useRef(connected)
@@ -256,6 +259,60 @@ export default function App() {
     return entry.quiet ? 'quiet' : 'loud'
   }
 
+  function notifyTtsResumeWaiters() {
+    const list = ttsResumeWaiters.current.splice(0)
+    for (const w of list) w()
+  }
+
+  function waitTtsNotPaused(timeoutMs = 120000): Promise<boolean> {
+    if (!ttsPausedRef.current) return Promise.resolve(true)
+    return new Promise((resolve) => {
+      const timer = window.setTimeout(() => {
+        ttsResumeWaiters.current = ttsResumeWaiters.current.filter((w) => w !== onResume)
+        resolve(false)
+      }, timeoutMs)
+      const onResume = () => {
+        window.clearTimeout(timer)
+        resolve(true)
+      }
+      ttsResumeWaiters.current.push(onResume)
+    })
+  }
+
+  /**
+   * 打断本机喂入并 AT+STOP 清固件队列。
+   * quiet：替换播报时不 toast / 不写对话气泡。
+   */
+  async function sendAtStop(opts?: { quiet?: boolean }): Promise<AtOutcome> {
+    ttsAbortRef.current = true
+    ttsPausedRef.current = false
+    notifyTtsResumeWaiters()
+    while (atWaiters.current.length) cancelLastAtWaiter()
+
+    if (!api || !connectedRef.current) {
+      return { ok: false, error: t(localeRef.current, 'notConnected') }
+    }
+
+    const pending = waitForAtReply(4000)
+    const res = await api.sendCmd('AT+STOP')
+    if (!res.ok) {
+      cancelLastAtWaiter()
+      pushLog('ERR AT+STOP', 'sys')
+      return { ok: false, error: res.error || t(localeRef.current, 'sendFailed') }
+    }
+    pushLog('AT+STOP', 'tx')
+    const reply = await pending
+    if (!reply.ok && !opts?.quiet) {
+      pushLog('FAIL AT+STOP', 'sys')
+    }
+    return reply
+  }
+
+  /**
+   * 上位机不切 GTA 帧：整段/大块 AT+TTS 入 4KB 池；等 OK=入队。
+   * 跟 +TTS:PAUSE/RESUME，不跟模组 B1/AC。切包由固件 ≤127 完成。
+   * 单次文本 ≤4KB。
+   */
   async function playTts(text: string, kind: ChatItem['kind'] = 'tts') {
     if (!api || !ensureModuleReady()) return false
     const payload = text.replace(/\r?\n/g, ' ').trim()
@@ -266,35 +323,54 @@ export default function App() {
       return false
     }
 
-    const packets = splitTtsPackets(payload)
-    if (packets.length === 0) return false
+    const chunks = splitForAtLine(payload)
+    if (chunks.length === 0) return false
 
     ttsAbortRef.current = false
     setSending(true)
     setDeviceState('TTS')
     try {
-      for (let i = 0; i < packets.length; i++) {
+      for (let i = 0; i < chunks.length; i++) {
         if (ttsAbortRef.current) return false
-        const chunk = packets[i]
-        // 等 OK 再发下一包；AT+STOP 会 cancel waiter 并置 ttsAbortRef
-        const pending = waitForAtReply(15000)
-        const res = await api.sendTts(chunk)
-        if (!res.ok) {
-          cancelLastAtWaiter()
+        if (!(await waitTtsNotPaused())) {
           if (ttsAbortRef.current) return false
-          flashToast(res.error || t(localeRef.current, 'sendFailed'), 'fail')
+          flashToast(t(localeRef.current, 'ttsPacketFail'), 'fail')
           return false
         }
-        pushLog(`AT+TTS=[${i + 1}/${packets.length}] ${chunk}`, 'tx')
-        const reply = await pending
-        if (ttsAbortRef.current || (!reply.ok && reply.error === 'cancelled')) return false
-        if (!reply.ok) {
-          const msg =
-            reply.error === 'timeout'
-              ? t(localeRef.current, 'cmdTimeout')
-              : t(localeRef.current, 'ttsPacketFail')
-          flashToast(msg, 'fail')
-          return false
+        if (ttsAbortRef.current) return false
+
+        const chunk = chunks[i]
+        let attempt = 0
+        for (;;) {
+          attempt += 1
+          if (ttsAbortRef.current) return false
+          const pending = waitForAtReply(15000)
+          const res = await api.sendTts(chunk)
+          if (!res.ok) {
+            cancelLastAtWaiter()
+            if (ttsAbortRef.current) return false
+            flashToast(res.error || t(localeRef.current, 'sendFailed'), 'fail')
+            return false
+          }
+          pushLog(
+            chunks.length > 1
+              ? `AT+TTS=[${i + 1}/${chunks.length}] (${utf8ByteLength(chunk)}B)`
+              : `AT+TTS (${utf8ByteLength(chunk)}B)`,
+            'tx',
+          )
+          const reply = await pending
+          if (ttsAbortRef.current || (!reply.ok && reply.error === 'cancelled')) return false
+          if (reply.ok) break
+          /* 高水位 ERROR：等 RESUME 再重试本块 */
+          if (attempt >= 8) {
+            flashToast(t(localeRef.current, 'ttsPacketFail'), 'fail')
+            return false
+          }
+          pushLog('TTS queue busy, wait RESUME', 'sys')
+          if (!(await waitTtsNotPaused())) {
+            flashToast(t(localeRef.current, 'ttsPacketFail'), 'fail')
+            return false
+          }
         }
       }
       if (ttsAbortRef.current) return false
@@ -358,30 +434,17 @@ export default function App() {
 
   async function stopOrInterrupt() {
     turnId.current += 1
-    ttsAbortRef.current = true
     llmAbort.current?.abort()
     llmAbort.current = null
     setLlmBusy(false)
     setSending(false)
-
-    // Unblock playTts waiting on OK, then send AT+STOP
-    while (atWaiters.current.length) cancelLastAtWaiter()
 
     if (!api || !connectedRef.current) {
       flashToast(t(locale, 'notConnected'), 'fail')
       return
     }
 
-    const pending = waitForAtReply(4000)
-    const res = await api.sendCmd('AT+STOP')
-    if (!res.ok) {
-      cancelLastAtWaiter()
-      flashToast(res.error || t(locale, 'sendFailed'), 'fail')
-      pushLog('ERR AT+STOP', 'sys')
-      return
-    }
-    pushLog('AT+STOP', 'tx')
-    const reply = await pending
+    const reply = await sendAtStop()
     if (reply.ok) {
       flashToast(t(locale, 'ttsStopped'), 'ok')
       setChat((prev) => [
@@ -390,9 +453,10 @@ export default function App() {
       ])
     } else {
       const msg =
-        reply.error === 'timeout' ? t(locale, 'cmdTimeout') : t(locale, 'cmdFail')
+        reply.error === 'timeout'
+          ? t(locale, 'cmdTimeout')
+          : reply.error || t(locale, 'cmdFail')
       flashToast(msg, 'fail')
-      pushLog('FAIL AT+STOP', 'sys')
     }
   }
 
@@ -451,8 +515,12 @@ export default function App() {
         flashToast(message === 'ERROR' ? t(localeRef.current, 'cmdError') : message, 'fail')
       }),
       api.onLog(({ line }) => {
+        // DOA：只更新罗盘，不写设备日志（含主动上报 / 查询）
         const angleHit = line.match(/^\+?ANGLE:\s*(-?\d+(?:\.\d+)?)/i)
-        if (angleHit) setAngle(Number(angleHit[1]))
+        if (angleHit) {
+          setAngle(Number(angleHit[1]))
+          return
+        }
 
         const volHit = line.match(/^\+VOL:\s*(\d+)/i)
         if (volHit) {
@@ -479,7 +547,19 @@ export default function App() {
           return
         }
 
-        // Intermediate URCs (+TTS:<n>, +READY, +ERROR:…) — final OK/ERROR resolves waiter
+        if (/^\+TTS:PAUSE\b/i.test(line)) {
+          ttsPausedRef.current = true
+          pushLog(line, 'rx')
+          return
+        }
+        if (/^\+TTS:RESUME\b/i.test(line)) {
+          ttsPausedRef.current = false
+          notifyTtsResumeWaiters()
+          pushLog(line, 'rx')
+          return
+        }
+
+        // Intermediate URCs (+TTS:…, +READY, +ERROR:…) — final OK/ERROR resolves waiter
         if (/^\+TTS:/i.test(line) || /^\+READY$/i.test(line) || /^\+ERROR:/i.test(line)) {
           pushLog(line, 'rx')
           return
@@ -492,9 +572,6 @@ export default function App() {
           const kind = resolveAtReply(false, 'ERROR')
           if (kind === 'quiet') return
         }
-
-        // Quiet DOA poll: skip flooding the log with ANGLE replies
-        if (doaPollingRef.current && /^\+?ANGLE:/i.test(line)) return
 
         pushLog(line, 'rx')
       }),
@@ -577,8 +654,34 @@ export default function App() {
     }
   }
 
+  /** 文本区发送：先 AT+STOP 清队列，再播新文本（打断替换） */
   async function sendManualTts(raw: string) {
-    const ok = await playTts(raw, 'tts')
+    if (!ensureModuleReady()) return
+    const payload = raw.replace(/\r?\n/g, ' ').trim()
+    if (!payload) return
+    if (utf8ByteLength(payload) > TTS_TOTAL_MAX) {
+      flashToast(t(localeRef.current, 'ttsTooLong'), 'fail')
+      return
+    }
+
+    turnId.current += 1
+    llmAbort.current?.abort()
+    llmAbort.current = null
+    setLlmBusy(false)
+    setSending(true)
+
+    const stop = await sendAtStop({ quiet: true })
+    if (!stop.ok) {
+      setSending(false)
+      const msg =
+        stop.error === 'timeout'
+          ? t(localeRef.current, 'cmdTimeout')
+          : stop.error || t(localeRef.current, 'cmdFail')
+      flashToast(msg, 'fail')
+      return
+    }
+
+    const ok = await playTts(payload, 'tts')
     if (ok) setTtsText('')
   }
 
@@ -697,7 +800,14 @@ export default function App() {
   async function refreshAngle() {
     setCmdBusy(true)
     try {
-      await sendDeviceCmd('AT+ANGLE?', { successMsg: t(locale, 'doaQueryOk') })
+      const reply = await sendDeviceCmd('AT+ANGLE?', { quiet: true })
+      if (reply.ok) flashToast(t(locale, 'doaQueryOk'), 'ok')
+      else {
+        flashToast(
+          reply.error === 'timeout' ? t(locale, 'cmdTimeout') : t(locale, 'cmdFail'),
+          'fail',
+        )
+      }
     } finally {
       setCmdBusy(false)
     }

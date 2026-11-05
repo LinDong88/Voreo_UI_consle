@@ -1,6 +1,12 @@
-/** Host TTS packet size (leave margin under firmware 128B max) */
-export const TTS_PACKET_MAX = 120
-export const TTS_TOTAL_MAX = 2048
+/**
+ * 上位机不再按 GTA 帧切包：整段入固件 4KB 队列，由固件按 ≤127 切给模组。
+ * 单次文本上限 = 固件缓冲 4KB；仅当触及 AT 单行上限时粗切（流控靠 +TTS:PAUSE/RESUME）。
+ */
+export const TTS_FW_BUF_MAX = 4096
+/** 单次 AT+TTS 载荷上限（与固件行缓冲一致，留一点余量给命令头） */
+export const TTS_AT_CHUNK_MAX = 4000
+/** 单次发送文本 UTF-8 上限（对齐固件 4KB 池） */
+export const TTS_TOTAL_MAX = TTS_FW_BUF_MAX
 
 const encoder = new TextEncoder()
 
@@ -8,55 +14,27 @@ export function utf8ByteLength(text: string): number {
   return encoder.encode(text).length
 }
 
-/** Prefer cut after these when a packet nears the byte limit */
-function isPunctChar(ch: string): boolean {
-  return /[，。！？；、：,.!?;:\s…—\-《》〈〉「」『』""''（）()]/.test(ch)
-}
-
 /**
- * Split UTF-8 text into packets ≤ maxBytes.
- * Prefer punctuation/whitespace boundaries only when a packet hits the byte limit.
+ * 仅当整段超过 AT 单行上限时，按 UTF-8 字节硬切成 ≤ maxBytes 的块（无标点策略）。
+ * 正常短文返回单元素数组。
  */
-export function splitTtsPackets(text: string, maxBytes = TTS_PACKET_MAX): string[] {
+export function splitForAtLine(text: string, maxBytes = TTS_AT_CHUNK_MAX): string[] {
   const src = text.replace(/\r?\n/g, ' ').trim()
   if (!src) return []
+  if (utf8ByteLength(src) <= maxBytes) return [src]
 
-  const packets: string[] = []
-  let offset = 0
-
-  while (offset < src.length) {
-    let end = offset
-    let bytes = 0
-    let lastPunctEnd = -1
-
-    while (end < src.length) {
-      const ch = src[end]
-      const chBytes = encoder.encode(ch).length
-      if (bytes + chBytes > maxBytes) break
-      bytes += chBytes
-      end += 1
-      if (isPunctChar(ch)) lastPunctEnd = end
+  const bytes = encoder.encode(src)
+  const chunks: string[] = []
+  const decoder = new TextDecoder()
+  let i = 0
+  while (i < bytes.length) {
+    let end = Math.min(i + maxBytes, bytes.length)
+    if (end < bytes.length) {
+      while (end > i && (bytes[end] & 0xc0) === 0x80) end--
+      if (end === i) end = Math.min(i + maxBytes, bytes.length)
     }
-
-    if (end === offset) {
-      // Single code point larger than max (shouldn't happen for normal text)
-      packets.push(src[offset])
-      offset += 1
-      continue
-    }
-
-    // Only back up to punctuation when this packet filled to the byte limit
-    const hitLimit = end < src.length
-    if (hitLimit) {
-      const minKeep = Math.max(1, Math.floor((end - offset) / 4))
-      if (lastPunctEnd > offset + minKeep) {
-        end = lastPunctEnd
-      }
-    }
-
-    packets.push(src.slice(offset, end))
-    offset = end
+    chunks.push(decoder.decode(bytes.subarray(i, end)))
+    i = end
   }
-
-  return packets
+  return chunks
 }
