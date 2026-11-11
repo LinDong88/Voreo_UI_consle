@@ -1,6 +1,9 @@
 import { Locale, t } from '../i18n'
 
 export type DoaMode = 0 | 1 | 2
+export type DoaPollIntervalMs = 100 | 200 | 500 | 1000
+
+export const DOA_POLL_INTERVALS: DoaPollIntervalMs[] = [100, 200, 500, 1000]
 
 type Props = {
   locale: Locale
@@ -9,6 +12,10 @@ type Props = {
   doaMode: DoaMode | null
   onDoaModeChange: (mode: DoaMode) => void
   onRefresh: () => void
+  polling: boolean
+  pollIntervalMs: DoaPollIntervalMs
+  onPollIntervalChange: (ms: DoaPollIntervalMs) => void
+  onTogglePoll: () => void
   busy?: boolean
 }
 
@@ -19,6 +26,10 @@ export function DoaPanel({
   doaMode,
   onDoaModeChange,
   onRefresh,
+  polling,
+  pollIntervalMs,
+  onPollIntervalChange,
+  onTogglePoll,
   busy,
 }: Props) {
   const deg = angle ?? 0
@@ -49,11 +60,40 @@ export function DoaPanel({
               <option value={2}>{t(locale, 'doaModeListening')}</option>
             </select>
           </label>
+          <label className="doa-mode-field">
+            <span className="sr-only">{t(locale, 'doaPollInterval')}</span>
+            <select
+              className="text-input doa-mode-select"
+              value={pollIntervalMs}
+              disabled={busy && !polling}
+              onChange={(e) => {
+                const v = Number(e.target.value)
+                if (v === 100 || v === 200 || v === 500 || v === 1000) {
+                  onPollIntervalChange(v)
+                }
+              }}
+            >
+              {DOA_POLL_INTERVALS.map((ms) => (
+                <option key={ms} value={ms}>
+                  {ms} ms
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            className={`btn btn-sm ${polling ? 'btn-primary' : 'btn-ghost'}`}
+            onClick={onTogglePoll}
+            disabled={busy && !polling}
+            aria-pressed={polling}
+          >
+            {polling ? t(locale, 'doaPollOff') : t(locale, 'doaPollOn')}
+          </button>
           <button
             type="button"
             className="btn btn-ghost btn-sm"
             onClick={onRefresh}
-            disabled={busy}
+            disabled={busy || polling}
           >
             {t(locale, 'doaRefresh')}
           </button>
@@ -61,7 +101,7 @@ export function DoaPanel({
       </div>
 
       <div className="doa-body">
-        <div className={`doa-compass ${active ? 'live' : ''}`} aria-hidden>
+        <div className={`doa-compass ${active ? 'live' : ''} ${polling ? 'polling' : ''}`} aria-hidden>
           <div className="doa-ring" />
           <div className="doa-tick n">0°</div>
           <div className="doa-tick e">90°</div>
@@ -92,6 +132,11 @@ export function DoaPanel({
             </div>
           </div>
           {!active && energy == null ? <p className="hint">{t(locale, 'doaWaiting')}</p> : null}
+          {polling ? (
+            <p className="hint">
+              {t(locale, 'doaPollingHint')} · {pollIntervalMs} ms
+            </p>
+          ) : null}
         </div>
       </div>
     </section>

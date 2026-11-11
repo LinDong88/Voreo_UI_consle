@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { ensureVoreoApi } from './bridge'
 import { DeviceSettings, DeviceSettingsState } from './components/DeviceSettings'
 import { DeviceStateIcon } from './components/DeviceStateIcon'
-import { DoaMode, DoaPanel } from './components/DoaPanel'
+import { DoaMode, DoaPanel, DoaPollIntervalMs } from './components/DoaPanel'
 import { LlmPanel } from './components/LlmPanel'
 import { WakeWordPanel } from './components/WakeWordPanel'
 import { DeviceStateName, isModuleReady, isStateInitPending, parseDeviceState } from './deviceState'
@@ -15,7 +15,7 @@ import {
   loadLlmConfig,
   saveLlmConfig,
 } from './llm'
-import { LOG_ANGLE_URC } from './debugFlags'
+import { LOG_ANGLE_URC, LOG_ENERGY_URC } from './debugFlags'
 import { splitForAtLine, utf8ByteLength } from './ttsPacket'
 import type { SerialPortInfo } from './vite-env'
 
@@ -91,6 +91,8 @@ export default function App() {
   const [angle, setAngle] = useState<number | null>(null)
   const [energy, setEnergy] = useState<number | null>(null)
   const [doaMode, setDoaMode] = useState<DoaMode | null>(null)
+  const [doaPolling, setDoaPolling] = useState(false)
+  const [doaPollIntervalMs, setDoaPollIntervalMs] = useState<DoaPollIntervalMs>(100)
   const [device, setDevice] = useState<DeviceSettingsState>(loadDeviceSettings)
   const [wakeCurrent, setWakeCurrent] = useState(DEFAULT_WAKE)
   const [wakeDraft, setWakeDraft] = useState('')
@@ -113,6 +115,8 @@ export default function App() {
   const localeRef = useRef(locale)
   const llmRef = useRef(llm)
   const connectedRef = useRef(connected)
+  const doaPollingRef = useRef(false)
+  const doaPollInFlight = useRef(false)
   const atWaiters = useRef<
     Array<{ resolve: (v: AtOutcome) => void; timer: number; quiet: boolean }>
   >([])
@@ -129,6 +133,7 @@ export default function App() {
   useEffect(() => {
     connectedRef.current = connected
     if (!connected) {
+      setDoaPolling(false)
       setDeviceState(null)
       deviceStateRef.current = null
       setEnergy(null)
@@ -145,6 +150,43 @@ export default function App() {
   useEffect(() => {
     deviceStateRef.current = deviceState
   }, [deviceState])
+
+  useEffect(() => {
+    doaPollingRef.current = doaPolling
+  }, [doaPolling])
+
+  /** 定时查询角度 + 能量；间隔可切换；上一轮未完成则跳过 */
+  useEffect(() => {
+    if (!doaPolling || !api) return
+
+    const tick = () => {
+      if (!connectedRef.current || doaPollInFlight.current) return
+      if (!isModuleReady(deviceStateRef.current)) return
+      if (atWaiters.current.length > 0) return
+      doaPollInFlight.current = true
+      void (async () => {
+        for (const line of ['AT+ANGLE?', 'AT+ENERGY?'] as const) {
+          if (!connectedRef.current || !doaPollingRef.current) break
+          if (atWaiters.current.length > 0) break
+          const pending = waitForAtReply(1500, true)
+          const res = await api.sendCmd(line)
+          if (!res.ok) {
+            cancelLastAtWaiter()
+            continue
+          }
+          await pending
+        }
+      })()
+        .catch(() => undefined)
+        .finally(() => {
+          doaPollInFlight.current = false
+        })
+    }
+
+    tick()
+    const id = window.setInterval(tick, doaPollIntervalMs)
+    return () => window.clearInterval(id)
+  }, [doaPolling, doaPollIntervalMs, api])
 
   /** Init only: poll AT+STATE? every 1s until a non-BOOTING state (query or URC). */
   useEffect(() => {
@@ -499,21 +541,22 @@ export default function App() {
       api.onError(({ message }) => {
         // OK/ERROR handled by AT waiters via onLog — avoid duplicate toasts
         if (atWaiters.current.length > 0) return
+        if (doaPollingRef.current && message === 'ERROR') return
         flashToast(message === 'ERROR' ? t(localeRef.current, 'cmdError') : message, 'fail')
       }),
       api.onLog(({ line }) => {
-        // DOA：更新罗盘；角度日志由 LOG_ANGLE_URC 开关
+        // DOA：更新罗盘；定时轮询时不写 log，避免刷屏
         const angleHit = line.match(/^\+?ANGLE:\s*(-?\d+(?:\.\d+)?)/i)
         if (angleHit) {
           setAngle(Number(angleHit[1]))
-          if (LOG_ANGLE_URC) pushLog(line, 'rx')
+          if (LOG_ANGLE_URC && !doaPollingRef.current) pushLog(line, 'rx')
           return
         }
 
         const energyHit = line.match(/^\+ENERGY:\s*(\d+)/i)
         if (energyHit) {
           setEnergy(Math.max(0, Math.min(255, Number(energyHit[1]))))
-          pushLog(line, 'rx')
+          if (LOG_ENERGY_URC && !doaPollingRef.current) pushLog(line, 'rx')
           return
         }
 
@@ -625,6 +668,10 @@ export default function App() {
 
   const moduleReady = connected && isModuleReady(deviceState)
 
+  useEffect(() => {
+    if (!moduleReady && doaPolling) setDoaPolling(false)
+  }, [moduleReady, doaPolling])
+
   const showInitWait = connected && !moduleReady
 
   useEffect(() => {
@@ -665,6 +712,7 @@ export default function App() {
 
   async function handleDisconnect() {
     if (!api) return
+    setDoaPolling(false)
     while (atWaiters.current.length) cancelLastAtWaiter()
     const res = await api.disconnect()
     if (res.ok) {
@@ -971,6 +1019,17 @@ export default function App() {
             doaMode={doaMode}
             onDoaModeChange={(mode) => void applyDoaMode(mode)}
             onRefresh={() => void refreshAngle()}
+            polling={doaPolling}
+            pollIntervalMs={doaPollIntervalMs}
+            onPollIntervalChange={setDoaPollIntervalMs}
+            onTogglePoll={() => {
+              if (doaPolling) {
+                setDoaPolling(false)
+                return
+              }
+              if (!ensureModuleReady()) return
+              setDoaPolling(true)
+            }}
             busy={cmdBusy || (connected && !moduleReady)}
           />
         </div>
