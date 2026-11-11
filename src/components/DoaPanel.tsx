@@ -1,36 +1,59 @@
 import { Locale, t } from '../i18n'
 
+export type DoaMode = 0 | 1 | 2
+
 type Props = {
   locale: Locale
   angle: number | null
+  energy: number | null
+  doaMode: DoaMode | null
+  onDoaModeChange: (mode: DoaMode) => void
   onRefresh: () => void
-  polling: boolean
-  onTogglePoll: () => void
   busy?: boolean
 }
 
-export function DoaPanel({ locale, angle, onRefresh, polling, onTogglePoll, busy }: Props) {
+export function DoaPanel({
+  locale,
+  angle,
+  energy,
+  doaMode,
+  onDoaModeChange,
+  onRefresh,
+  busy,
+}: Props) {
   const deg = angle ?? 0
   const active = angle != null
+  const energyPct = energy == null ? 0 : Math.max(0, Math.min(100, (energy / 255) * 100))
 
   return (
     <section className="card card-pad doa-card">
       <div className="card-head">
         <h2 className="section-title">{t(locale, 'doaTitle')}</h2>
         <div className="doa-actions">
-          <button
-            type="button"
-            className={`btn btn-sm ${polling ? 'btn-primary' : 'btn-ghost'}`}
-            onClick={onTogglePoll}
-            aria-pressed={polling}
-          >
-            {polling ? t(locale, 'doaPollOff') : t(locale, 'doaPollOn')}
-          </button>
+          <label className="doa-mode-field">
+            <span className="sr-only">{t(locale, 'doaMode')}</span>
+            <select
+              className="text-input doa-mode-select"
+              value={doaMode ?? ''}
+              disabled={busy}
+              onChange={(e) => {
+                const v = Number(e.target.value)
+                if (v === 0 || v === 1 || v === 2) onDoaModeChange(v)
+              }}
+            >
+              <option value="" disabled>
+                {t(locale, 'doaModePick')}
+              </option>
+              <option value={0}>{t(locale, 'doaModeOff')}</option>
+              <option value={1}>{t(locale, 'doaModeOn')}</option>
+              <option value={2}>{t(locale, 'doaModeListening')}</option>
+            </select>
+          </label>
           <button
             type="button"
             className="btn btn-ghost btn-sm"
             onClick={onRefresh}
-            disabled={busy || polling}
+            disabled={busy}
           >
             {t(locale, 'doaRefresh')}
           </button>
@@ -38,7 +61,7 @@ export function DoaPanel({ locale, angle, onRefresh, polling, onTogglePoll, busy
       </div>
 
       <div className="doa-body">
-        <div className={`doa-compass ${active ? 'live' : ''} ${polling ? 'polling' : ''}`} aria-hidden>
+        <div className={`doa-compass ${active ? 'live' : ''}`} aria-hidden>
           <div className="doa-ring" />
           <div className="doa-tick n">0°</div>
           <div className="doa-tick e">90°</div>
@@ -51,12 +74,24 @@ export function DoaPanel({ locale, angle, onRefresh, polling, onTogglePoll, busy
         </div>
 
         <div className="doa-metrics">
-          <div className="metric">
-            <span className="metric-label">{t(locale, 'angle')}</span>
-            <strong className="metric-value">{angle == null ? '—' : `${Math.round(angle)}°`}</strong>
+          <div className="metric-row">
+            <div className="metric">
+              <span className="metric-label">{t(locale, 'angle')}</span>
+              <strong className="metric-value">
+                {angle == null ? '—' : `${Math.round(angle)}°`}
+              </strong>
+            </div>
+            <div className="metric">
+              <span className="metric-label">{t(locale, 'energy')}</span>
+              <strong className="metric-value">
+                {energy == null ? '—' : Math.round(energy)}
+              </strong>
+              <div className="meter" aria-hidden>
+                <i style={{ width: `${energyPct}%` }} />
+              </div>
+            </div>
           </div>
-          {!active ? <p className="hint">{t(locale, 'doaWaiting')}</p> : null}
-          {polling ? <p className="hint">{t(locale, 'doaPollOn')}</p> : null}
+          {!active && energy == null ? <p className="hint">{t(locale, 'doaWaiting')}</p> : null}
         </div>
       </div>
     </section>

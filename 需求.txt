@@ -39,7 +39,7 @@
   - AT+VOL=<0~15> / AT+VOL?     音量设置 / 查询
   - AT+SPD=<0~15> / AT+SPD?     语速设置 / 查询
   - AT+ANGLE?                   读 DOA 角度 → +ANGLE:<deg>
-  - AT+WAKEWORD=<word> / ?      设/查英文唤醒词（恢复默认 HI ESP）
+  - AT+WAKEWORD=<word> / ?      设/查英文唤醒词（恢复默认 hcLb qdMZ / hello james）
   - AT+STOP                     打断 ASR/TTS 播报 → OK
   - 连接后默认 BOOTING，每 1s AT+STATE?；收到就绪 STATE（查询或主动上报）后停止轮询，之后靠 URC；亦可手动刷新
   - 成功：+VOL:/+SPD:/+TTS:/… → OK；失败：+ERROR:… → ERROR

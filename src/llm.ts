@@ -13,7 +13,7 @@ export const defaultLlmConfig = (): LlmConfig => ({
   apiKey: '',
   model: '',
   enabled: false,
-  autoReply: true,
+  autoReply: false,
   useDemoReply: false,
 })
 

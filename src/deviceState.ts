@@ -61,7 +61,7 @@ export function isModuleReady(state: DeviceStateName | null): boolean {
   return state !== 'BOOTING' && state !== 'BOOT_FAIL' && state !== 'UNKNOWN'
 }
 
-/** Still waiting for first real state — keep AT+STATE? poll. */
+/** Still waiting for first real state (URC or manual AT+STATE?). */
 export function isStateInitPending(state: DeviceStateName | null): boolean {
   return !state || state === 'BOOTING' || state === 'UNKNOWN'
 }
